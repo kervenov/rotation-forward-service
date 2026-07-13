@@ -1,0 +1,64 @@
+# rotation-forward-service
+
+Lightweight forward-server agent for Marzban **Auto Rotation**. One tiny,
+crash-proof Python daemon (stdlib only) plus the port-forwarding rules.
+
+- **Port forwarding** (iptables DNAT/MASQUERADE) — unchanged, re-applied at boot.
+- **Control listener** — a minimal HTTP endpoint the panel calls to
+  `activate` / `deactivate` this box. Accepted **only from the panel's IP**
+  (no token, no operator input).
+- **Traffic reporter** — while **ACTIVE**, every `INTERVAL` seconds it reads
+  conntrack, finds the client IPs that actually moved bytes, and POSTs them to
+  the panel. While **STANDBY** it does nothing → reserved boxes burn ~0 CPU/RAM.
+
+`deactivate` stops **only** the reporting loop — forwarding keeps running.
+
+## How the panel drives it
+
+```
+panel sets current_ip = <this box>  ->  POST http://<this>:8765/control {"command":"activate"}
+rotate / edit away from this box     ->  POST http://<old>:8765/control  {"command":"deactivate"}
+```
+
+The role (active/standby) is persisted to `/var/lib/rotation-agent/state`, so a
+restart resumes it. Every loop is wrapped and the systemd unit sets
+`StartLimitIntervalSec=0`, so the agent can never crash-loop itself into the
+"start request repeated too quickly" dead state — it's universal across VPS.
+
+## Install
+
+```bash
+git clone https://github.com/kervenov/rotation-forward-service.git
+cd rotation-forward-service
+# edit the port->main-VPS map in rotation-portfwd.sh and the config block
+# (PANEL_URL / CONTROL_PORT / INTERVAL) at the top of install.sh if needed
+sudo bash install.sh
+```
+
+No prompts, no token. The agent comes up **STANDBY** and waits for the panel to
+`activate` it.
+
+## Config (env, set in install.sh)
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `PANEL_URL` | `https://ze.cyber-x.online:10086/api/auto-rotation/traffic` | Where reports are POSTed. Its host also defines the only IP allowed to send control commands. |
+| `CONTROL_PORT` | `8765` | Inbound activate/deactivate endpoint. Not in the DNAT map, so it's delivered locally. |
+| `INTERVAL` | `60` | Seconds between reports while ACTIVE. |
+| `PANEL_IP` | *(empty)* | Optional extra allowed control-source IP(s), comma-separated (e.g. if the panel egresses from a different IP than its DNS). |
+
+## Operate
+
+```bash
+journalctl -u rotation-agent -f                 # live log
+curl -s http://127.0.0.1:8765/health            # {active, interval, panel_ips, ...}
+systemctl status rotation-agent portfwd         # service state
+```
+
+## Files
+
+| File | Role |
+|------|------|
+| `rotation-agent.py` | The daemon: control listener + gated traffic reporter. |
+| `rotation-portfwd.sh` | Port forwarding rules (edit `rules` for this box). Boot-persistent via `portfwd.service`. |
+| `install.sh` | Turnkey installer — deps, both services, no input. |
