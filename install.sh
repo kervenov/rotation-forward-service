@@ -140,6 +140,14 @@ echo "[*] Installing agent -> $AGENT_DST"
 install -m 0755 "$AGENT_SRC" "$AGENT_DST"
 mkdir -p /var/lib/rotation-agent
 
+# Retire the previous single-script reporter if present — the agent supersedes
+# it. Leaving it running would double-report every 10s and spam the panel.
+if systemctl list-unit-files 2>/dev/null | grep -q '^traffic-reporter\.service'; then
+  echo "[*] Eski traffic-reporter.service kaldırılıyor (agent onun yerine geçti)..."
+  systemctl disable --now traffic-reporter.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/traffic-reporter.service /root/traffic_reporter.py 2>/dev/null || true
+fi
+
 cat > "$AGENT_SERVICE" <<EOF
 [Unit]
 Description=Rotation forward-service agent (control listener + traffic reporter)
