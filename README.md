@@ -25,18 +25,28 @@ restart resumes it. Every loop is wrapped and the systemd unit sets
 `StartLimitIntervalSec=0`, so the agent can never crash-loop itself into the
 "start request repeated too quickly" dead state — it's universal across VPS.
 
-## Install
+## Install (one line — nothing else needed on the box)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kervenov/rotation-forward-service/main/install.sh | sudo bash
+```
+
+That's it. The installer downloads the agent + forwarding payloads itself,
+handles a locked dpkg / broken DNS, retires any old reporter, and brings the
+agent up **STANDBY** — no prompts, no token. It waits for the panel to
+`activate` it.
+
+<details>
+<summary>Alternative: from a clone (to edit the port map / config first)</summary>
 
 ```bash
 git clone https://github.com/kervenov/rotation-forward-service.git
 cd rotation-forward-service
-# edit the port->main-VPS map in rotation-portfwd.sh and the config block
-# (PANEL_URL / CONTROL_PORT / INTERVAL) at the top of install.sh if needed
+# optional: edit the port->main-VPS map in rotation-portfwd.sh and the config
+# block (PANEL_URL / CONTROL_PORT / INTERVAL) at the top of install.sh
 sudo bash install.sh
 ```
-
-No prompts, no token. The agent comes up **STANDBY** and waits for the panel to
-`activate` it.
+</details>
 
 ## Config (env, set in install.sh)
 

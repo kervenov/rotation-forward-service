@@ -1,7 +1,11 @@
 #!/bin/bash
 # ============================================================================
 # rotation-forward-service installer — turnkey, NO input / NO token.
-# Run from the repo dir on a forward VPS:  sudo bash install.sh
+#
+# ONE-LINER (nothing else needed on the box):
+#   curl -fsSL https://raw.githubusercontent.com/kervenov/rotation-forward-service/main/install.sh | sudo bash
+#
+# Or from a clone:  sudo bash install.sh
 #
 # Installs:
 #   • Port forwarding (rotation-portfwd.sh) + portfwd.service (re-applies at boot)
@@ -20,17 +24,31 @@ PANEL_IP=""           # optional: pin the panel's IP for control auth if DNS is 
 CONTROL_PORT="8765"   # panel -> this box control endpoint (activate/deactivate)
 INTERVAL="60"         # seconds between reports while ACTIVE
 
-SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
-AGENT_SRC="$SRC_DIR/rotation-agent.py"
-PORTFWD_SRC="$SRC_DIR/rotation-portfwd.sh"
+# When run from a clone SRC_DIR holds the sibling files; when piped through
+# `curl … | bash` there is no script dir, so the payload files are fetched
+# from the repo instead (see provide()).
+SRC_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo /nonexistent)"
 
 AGENT_DST="/usr/local/bin/rotation-agent.py"
 PORTFWD_DST="/usr/local/sbin/rotation-portfwd.sh"
 PORTFWD_SERVICE="/etc/systemd/system/portfwd.service"
 AGENT_SERVICE="/etc/systemd/system/rotation-agent.service"
 
-[ -f "$AGENT_SRC" ]   || { echo "[ERR] $AGENT_SRC yok"; exit 1; }
-[ -f "$PORTFWD_SRC" ] || { echo "[ERR] $PORTFWD_SRC yok"; exit 1; }
+# Single source of truth for the two payload files: local copy if present
+# (clone), otherwise download from the repo (one-liner install). No embedded
+# duplicates to keep in sync.
+RAW_BASE="https://raw.githubusercontent.com/kervenov/rotation-forward-service/main"
+provide() {   # provide <filename> <dest> <mode>
+  local name="$1" dst="$2" mode="$3"
+  if [ -f "$SRC_DIR/$name" ]; then
+    install -m "$mode" "$SRC_DIR/$name" "$dst"
+  else
+    echo "[*] $name indiriliyor (repo raw)..."
+    curl -fsSL "$RAW_BASE/$name" -o "$dst" \
+      || { echo "[ERR] $name indirilemedi (ağ/DNS?). Sonra tekrar deneyin."; exit 1; }
+    chmod "$mode" "$dst"
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # 1) Dependencies — robust to a locked dpkg (unattended-upgrades at boot) and
@@ -82,6 +100,10 @@ ensure_dns() {    # so BOTH apt and the agent can resolve the panel host
 ensure_dns "$PANEL_HOST" \
   || echo "[!] DNS hâlâ sorunlu — agent panel host'u çözemezse install.sh içinde PANEL_IP ayarlayın"
 
+# curl — needed by provide() to fetch the payload files when piped. Almost
+# always present (the one-liner is fetched with it), but make sure.
+command -v curl >/dev/null 2>&1 || { echo "[*] curl kuruluyor..."; apt_install curl || true; }
+
 # python3 — fatal only if truly absent AND uninstallable.
 if ! command -v python3 >/dev/null 2>&1; then
   echo "[*] python3 yok — kuruluyor..."
@@ -115,7 +137,7 @@ modprobe nf_conntrack_netlink 2>/dev/null || true
 # 2) Port forwarding + boot service (rules unchanged)
 # ---------------------------------------------------------------------------
 echo "[*] Installing forwarding -> $PORTFWD_DST"
-install -m 0755 "$PORTFWD_SRC" "$PORTFWD_DST"
+provide rotation-portfwd.sh "$PORTFWD_DST" 0755
 bash "$PORTFWD_DST"
 
 cat > "$PORTFWD_SERVICE" <<EOF
@@ -137,7 +159,7 @@ EOF
 # 3) Rotation agent + service
 # ---------------------------------------------------------------------------
 echo "[*] Installing agent -> $AGENT_DST"
-install -m 0755 "$AGENT_SRC" "$AGENT_DST"
+provide rotation-agent.py "$AGENT_DST" 0755
 mkdir -p /var/lib/rotation-agent
 
 # Retire the previous single-script reporter if present — the agent supersedes

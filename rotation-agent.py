@@ -48,6 +48,12 @@ SERVER_IP = ""
 active_event = threading.Event()
 standby_signal = threading.Event()
 
+# Cached panel-IP allowlist so a flood of control requests can't force a DNS
+# lookup per request (and so a transient DNS blip keeps the last-good set).
+PANEL_IP_TTL = 60
+_panel_ip_lock = threading.Lock()
+_panel_ip_cache = {"ips": set(), "ts": -1e9}
+
 
 def log(*a):
     print(*a, file=sys.stderr, flush=True)
@@ -138,10 +144,17 @@ def _panel_host():
 
 
 def panel_allowed_ips():
-    """The set of IPs allowed to send control commands: the panel host's
-    current DNS resolution + any PANEL_IP override. Resolved per-call (control
-    POSTs are rare — only on rotate) so it always tracks the panel's real IP,
-    with no token and no operator input."""
+    """The set of IPs allowed to send control commands: the panel host's DNS
+    resolution + any PANEL_IP override. Cached for PANEL_IP_TTL seconds so a
+    burst of requests can't force a DNS lookup each time; a transient resolve
+    failure falls back to the last-good set (never widens access). No token,
+    no operator input."""
+    now = time.monotonic()
+    with _panel_ip_lock:
+        cached = _panel_ip_cache["ips"]
+        if cached and (now - _panel_ip_cache["ts"]) < PANEL_IP_TTL:
+            return cached
+
     allowed = set()
     for extra in PANEL_IP_ENV.replace(",", " ").split():
         extra = extra.strip()
@@ -154,7 +167,14 @@ def panel_allowed_ips():
                 allowed.add(res[4][0])
         except Exception as e:
             log("panel DNS resolve failed for %s: %s" % (host, e))
-    return allowed
+
+    if allowed:
+        with _panel_ip_lock:
+            _panel_ip_cache["ips"] = allowed
+            _panel_ip_cache["ts"] = now
+        return allowed
+    # Resolve failed and no static override — keep trusting the last-good set.
+    return cached
 
 
 # ---------------------------------------------------------------------------
@@ -320,8 +340,13 @@ class ControlHandler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
-        # Health/debug — read-only, no secrets, so no auth needed.
+        # Health/debug. It exposes server_ip + panel_ips, so restrict it to
+        # localhost (the install prints a 127.0.0.1 curl) and the panel — an
+        # internet scanner hitting :8765 must not map the infrastructure.
         if self.path.rstrip("/") in ("/health", "/status", ""):
+            peer = self.client_address[0]
+            if peer not in ("127.0.0.1", "::1") and peer not in panel_allowed_ips():
+                return self._send(403, {"detail": "forbidden", "peer": peer})
             return self._send(200, {
                 "server_ip": SERVER_IP,
                 "active": active_event.is_set(),
