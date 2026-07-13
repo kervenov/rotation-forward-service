@@ -16,6 +16,7 @@ set -e
 
 # ===== Config (edit here; no interactive prompts) =====
 PANEL_URL="https://ze.cyber-x.online:10086/api/auto-rotation/traffic"
+PANEL_IP=""           # optional: pin the panel's IP for control auth if DNS is unreliable
 CONTROL_PORT="8765"   # panel -> this box control endpoint (activate/deactivate)
 INTERVAL="60"         # seconds between reports while ACTIVE
 
@@ -32,15 +33,76 @@ AGENT_SERVICE="/etc/systemd/system/rotation-agent.service"
 [ -f "$PORTFWD_SRC" ] || { echo "[ERR] $PORTFWD_SRC yok"; exit 1; }
 
 # ---------------------------------------------------------------------------
-# 1) Dependencies (python3 stdlib only + conntrack-tools for the -L fallback)
+# 1) Dependencies — robust to a locked dpkg (unattended-upgrades at boot) and
+#    to DNS/mirror failures. NEVER aborts the install: python3 is virtually
+#    always preinstalled, and conntrack-tools is only a fallback used when
+#    /proc/net/nf_conntrack is absent.
 # ---------------------------------------------------------------------------
 export DEBIAN_FRONTEND=noninteractive
-_need=""
-command -v python3 >/dev/null 2>&1 || _need="$_need python3"
-command -v conntrack >/dev/null 2>&1 || _need="$_need conntrack"
-if [ -n "$_need" ]; then
-  echo "[*] Installing:$_need"
-  apt-get update -qq && apt-get install -y -qq $_need
+PANEL_HOST="$(echo "$PANEL_URL" | sed -E 's#^[a-z]+://##; s#[:/].*$##')"
+
+apt_locked() {
+  if command -v fuser >/dev/null 2>&1; then
+    fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && return 0
+    fuser /var/lib/apt/lists/lock    >/dev/null 2>&1 && return 0
+  fi
+  pgrep -x unattended-upgr >/dev/null 2>&1 && return 0
+  return 1
+}
+wait_for_apt() {
+  local i=0
+  while apt_locked; do
+    i=$((i+1))
+    [ "$i" -gt 90 ] && { echo "[!] dpkg 180s+ kilitli — yine de deniyorum"; return 0; }
+    echo "[*] apt/dpkg kilitli (unattended-upgrades?) bekleniyor... ($i)"
+    sleep 2
+  done
+}
+apt_install() {   # best-effort; returns non-zero on failure so caller can fall back
+  wait_for_apt
+  # -o DPkg::Lock::Timeout: apt WAITS for the lock instead of erroring out.
+  apt-get -o DPkg::Lock::Timeout=180 update -qq 2>/dev/null \
+    || echo "[!] apt update başarısız (DNS/mirror) — cache ile deneniyor"
+  apt-get -o DPkg::Lock::Timeout=180 install -y -qq "$@" 2>/dev/null
+}
+ensure_dns() {    # so BOTH apt and the agent can resolve the panel host
+  getent hosts "$1" >/dev/null 2>&1 && return 0
+  echo "[!] DNS '$1' çözülemiyor — public resolver ekleniyor (1.1.1.1 / 8.8.8.8)"
+  if command -v resolvectl >/dev/null 2>&1; then
+    IFACE="$(ip route show default 2>/dev/null | awk '{print $5; exit}')"
+    [ -n "$IFACE" ] && resolvectl dns "$IFACE" 1.1.1.1 8.8.8.8 2>/dev/null || true
+  fi
+  if [ ! -L /etc/resolv.conf ]; then
+    grep -q '^nameserver 1.1.1.1' /etc/resolv.conf 2>/dev/null || echo "nameserver 1.1.1.1" >> /etc/resolv.conf
+    grep -q '^nameserver 8.8.8.8' /etc/resolv.conf 2>/dev/null || echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+  fi
+  getent hosts "$1" >/dev/null 2>&1
+}
+
+ensure_dns "$PANEL_HOST" \
+  || echo "[!] DNS hâlâ sorunlu — agent panel host'u çözemezse install.sh içinde PANEL_IP ayarlayın"
+
+# python3 — fatal only if truly absent AND uninstallable.
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "[*] python3 yok — kuruluyor..."
+  apt_install python3 || true
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "[ERR] python3 yok ve kurulamadı. Ağ/DNS düzelince: apt-get install -y python3"
+  exit 1
+fi
+
+# conntrack-tools — ONLY a fallback for kernels without /proc/net/nf_conntrack.
+modprobe nf_conntrack 2>/dev/null || true
+if [ ! -r /proc/net/nf_conntrack ] && ! command -v conntrack >/dev/null 2>&1; then
+  echo "[*] conntrack yok ve /proc/net/nf_conntrack yok — kurmayı deniyorum..."
+  apt_install conntrack || true
+fi
+if [ ! -r /proc/net/nf_conntrack ] && ! command -v conntrack >/dev/null 2>&1; then
+  echo "[!] UYARI: conntrack okunamıyor (ne /proc dosyası ne de binary)."
+  echo "    Ağ/DNS düzelince:  apt-get install -y conntrack"
+  echo "    Agent yine de kurulacak; conntrack gelene kadar rapor gönderemez ama"
+  echo "    ASLA yanlış sinyal vermez ve ASLA çökmez (sessiz bekler)."
 fi
 
 # conntrack byte accounting — REQUIRED for the bytes= deltas the agent uses.
@@ -89,6 +151,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 Environment=PANEL_URL=$PANEL_URL
+Environment=PANEL_IP=$PANEL_IP
 Environment=CONTROL_PORT=$CONTROL_PORT
 Environment=INTERVAL=$INTERVAL
 ExecStart=/usr/bin/python3 $AGENT_DST
