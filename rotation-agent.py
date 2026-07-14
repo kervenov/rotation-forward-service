@@ -36,7 +36,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PANEL_URL = os.environ.get("PANEL_URL", "")            # .../api/auto-rotation/traffic
 CONTROL_PORT = int(os.environ.get("CONTROL_PORT", "8765"))
-INTERVAL = int(os.environ.get("INTERVAL", "60"))       # seconds between reports (active)
+INTERVAL = int(os.environ.get("INTERVAL", "60"))       # seconds between POSTs to the panel
+# Sampling is DECOUPLED from reporting: conntrack is read every SAMPLE seconds
+# so the byte-delta stays fine-grained (a blocked flow freezes and is detected
+# within ~SAMPLE, not one whole report window). An IP counts as active if it
+# transferred within the last ACTIVE_WINDOW seconds; we POST that set every
+# INTERVAL. This is what keeps the count honest at a 60s report cadence — a
+# coarse 60s delta wrongly counts a flow that grew EARLIER in the window (before
+# a mid-window block) as still active.
+SAMPLE = int(os.environ.get("SAMPLE_INTERVAL", "15"))  # conntrack sampling seconds
+ACTIVE_WINDOW = int(os.environ.get("ACTIVE_WINDOW", "30"))  # "active" freshness seconds
 STATE_FILE = os.environ.get("STATE_FILE", "/var/lib/rotation-agent/state")
 PANEL_IP_ENV = os.environ.get("PANEL_IP", "")          # optional extra allowed IP(s), comma-sep
 CONNTRACK = "/proc/net/nf_conntrack"
@@ -290,33 +299,49 @@ def reporter_loop():
             active_event.wait()          # STANDBY: blocks, ~0 CPU, until activated
             standby_signal.clear()
             prev = None
-            log("ACTIVE — reporting active client IPs every %ds" % INTERVAL)
+            # client_ip -> monotonic time it was last seen TRANSFERRING (byte
+            # counter grew over a SHORT SAMPLE window). This is the freshness
+            # ledger; an IP is reported active only while it stays inside
+            # ACTIVE_WINDOW, so a blocked flow (frozen bytes) ages out fast.
+            last_seen = {}
+            last_post = time.monotonic()
+            log("ACTIVE — sampling conntrack every %ds, active-window %ds, "
+                "reporting every %ds" % (SAMPLE, ACTIVE_WINDOW, INTERVAL))
             while active_event.is_set():
                 try:
+                    now = time.monotonic()
                     cur, acct = read_conntrack()
                     if not acct:
                         log("nf_conntrack_acct OFF (no bytes=) — enable: "
                             "sysctl -w net.netfilter.nf_conntrack_acct=1")
                     elif prev is None:
-                        # first tick after activation: establish the byte
-                        # baseline, don't POST yet (no delta to compare).
-                        log("baseline established — first report in %ds" % INTERVAL)
+                        # first sample: establish the byte baseline (no delta
+                        # to compare yet).
+                        log("baseline established")
                     else:
-                        active = []
+                        # Fine-grained delta over the LAST SAMPLE only — a flow
+                        # that froze (blocked) shows no growth here even if it
+                        # grew earlier, so it stops refreshing last_seen.
                         for ip, b in cur.items():
                             pb = prev.get(ip)
                             if (pb is None and b > 0) or (pb is not None and b > pb):
-                                active.append(ip)
-                        active = sorted(set(active))
+                                last_seen[ip] = now
+                    if acct:
+                        prev = cur
+                    # Age out anyone not seen transferring within ACTIVE_WINDOW.
+                    last_seen = {ip: t for ip, t in last_seen.items()
+                                 if now - t <= ACTIVE_WINDOW}
+                    # POST the recently-active set on the report cadence.
+                    if now - last_post >= INTERVAL:
+                        active = sorted(last_seen.keys())
                         ok = post(active)
                         log("POST -> %d active client IP(s)%s"
                             % (len(active), "" if ok else " [FAILED]"))
-                    if acct:
-                        prev = cur
+                        last_post = now
                 except Exception as e:
                     log("reporter tick error (continuing):", e)
-                # Sleep INTERVAL, but wake immediately if deactivated.
-                if standby_signal.wait(INTERVAL):
+                # Sleep the SHORT sampling interval, wake at once if deactivated.
+                if standby_signal.wait(SAMPLE):
                     break
             log("STANDBY — traffic reports stopped (forwarding untouched)")
         except Exception as e:

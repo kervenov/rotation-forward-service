@@ -7,9 +7,13 @@ crash-proof Python daemon (stdlib only) plus the port-forwarding rules.
 - **Control listener** — a minimal HTTP endpoint the panel calls to
   `activate` / `deactivate` this box. Accepted **only from the panel's IP**
   (no token, no operator input).
-- **Traffic reporter** — while **ACTIVE**, every `INTERVAL` seconds it reads
-  conntrack, finds the client IPs that actually moved bytes, and POSTs them to
-  the panel. While **STANDBY** it does nothing → reserved boxes burn ~0 CPU/RAM.
+- **Traffic reporter** — while **ACTIVE**, it samples conntrack every
+  `SAMPLE_INTERVAL` seconds (fine-grained byte-delta) and POSTs to the panel
+  every `INTERVAL` seconds the client IPs that actually moved bytes within the
+  last `ACTIVE_WINDOW` seconds. Sampling is decoupled from reporting so a
+  blocked flow (frozen bytes) is detected within ~`SAMPLE_INTERVAL`, not a whole
+  report window. While **STANDBY** it does nothing → reserved boxes burn ~0
+  CPU/RAM.
 
 `deactivate` stops **only** the reporting loop — forwarding keeps running.
 
