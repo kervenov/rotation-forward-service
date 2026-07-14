@@ -20,7 +20,7 @@ set -e
 
 # ===== Config (edit here; no interactive prompts) =====
 PANEL_URL="https://ze.cyber-x.online:10086/api/auto-rotation/traffic"
-PANEL_IP=""           # optional: pin the panel's IP for control auth if DNS is unreliable
+PANEL_IP="37.228.117.207"  # panel egress IP — control-auth works even if agent DNS is flaky
 CONTROL_PORT="8765"   # panel -> this box control endpoint (activate/deactivate)
 INTERVAL="60"         # seconds between reports while ACTIVE
 
