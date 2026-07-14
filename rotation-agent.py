@@ -120,14 +120,42 @@ def get_active_ip():
         return active_ip
 
 
-def set_active(active):
+def _apply_events(active):
     if active:
         standby_signal.clear()
         active_event.set()
     else:
         active_event.clear()
         standby_signal.set()   # wake the sleeping reporter so it stops now
-    persist_state(active, get_active_ip())
+
+
+def activate_as(local_ip):
+    """Atomically go ACTIVE serving ``local_ip``. Returns the served IP. The
+    read+decide+mutate is under one lock so a concurrent deactivate for the OLD
+    IP (a rotate hits the same agent) can't clobber this activation."""
+    global active_ip
+    with _active_lock:
+        active_ip = local_ip or SERVER_IP
+        _apply_events(True)
+        ip = active_ip
+    persist_state(True, ip)   # file IO outside the lock
+    return ip
+
+
+def deactivate_for(local_ip):
+    """Atomically stop reporting IFF ``local_ip`` is the IP we're currently
+    active as (or we track none). Returns True if we deactivated, False if the
+    request was for a different (old) IP and so ignored. The whole check+mutate
+    is under one lock so it can't race an activate for the NEW IP."""
+    global active_ip
+    with _active_lock:
+        cur = active_ip
+        if cur and local_ip and local_ip != cur:
+            return False          # not the active IP — ignore, no mutation
+        active_ip = ""
+        _apply_events(False)
+    persist_state(False, "")
+    return True
 
 
 def gather_local_ips():
@@ -354,7 +382,21 @@ def post(active_ips, source_ip=""):
             conn.request("POST", path, body=body,
                          headers={"Content-Type": "application/json"})
             resp = conn.getresponse()
-            resp.read()
+            data = resp.read()
+            if not (200 <= resp.status < 300):
+                # Not a transport failure but the panel refused it — surface it.
+                log("POST rejected: HTTP %d (as %s)" % (resp.status, src or SERVER_IP))
+                return False
+            # Panel returns 200 with detail:"ignored" when the report's source
+            # IP isn't the current entry (e.g. binding didn't take) — log it so
+            # a silent auth mismatch is visible in the journal.
+            try:
+                detail = json.loads(data or b"{}").get("detail", "")
+            except Exception:
+                detail = ""
+            if detail and detail != "ok":
+                log("POST ignored by panel: %s (as %s)" % (detail, src or SERVER_IP))
+                return False
             return True
         except Exception as e:
             last = e
@@ -494,27 +536,23 @@ class ControlHandler(BaseHTTPRequestHandler):
             local_ip = ""
 
         if cmd == "activate":
-            set_active_ip(local_ip or SERVER_IP)
-            set_active(True)
-            log("control: ACTIVATE as %s (from %s)" % (local_ip or SERVER_IP, peer))
-            return self._send(200, {"detail": "activated",
-                                    "server_ip": local_ip or SERVER_IP})
+            ip = activate_as(local_ip)
+            log("control: ACTIVATE as %s (from %s)" % (ip, peer))
+            return self._send(200, {"detail": "activated", "server_ip": ip})
         if cmd == "deactivate":
+            # A rotate fires deactivate(old_ip)+activate(new_ip); on a multi-IP
+            # box both land on the SAME agent, so deactivate_for() only stops
+            # when this IS the currently-active IP — a late deactivate for the
+            # OLD ip must NOT kill the freshly-activated new one.
+            if deactivate_for(local_ip):
+                log("control: DEACTIVATE %s (from %s)" % (local_ip, peer))
+                return self._send(200, {"detail": "deactivated"})
             cur = get_active_ip()
-            # Only stop if THIS is the IP we are currently active as. A rotate
-            # fires deactivate(old_ip)+activate(new_ip); on a multi-IP box both
-            # land on the SAME agent, so a late deactivate for the OLD ip must
-            # NOT kill the freshly-activated new one.
-            if cur and local_ip and local_ip != cur:
-                log("control: DEACTIVATE for %s IGNORED (active as %s)"
-                    % (local_ip, cur))
-                return self._send(200, {"detail": "ignored",
-                                        "reason": "not the active IP",
-                                        "active_ip": cur})
-            set_active(False)
-            set_active_ip("")
-            log("control: DEACTIVATE %s (from %s)" % (local_ip, peer))
-            return self._send(200, {"detail": "deactivated"})
+            log("control: DEACTIVATE for %s IGNORED (active as %s)"
+                % (local_ip, cur))
+            return self._send(200, {"detail": "ignored",
+                                    "reason": "not the active IP",
+                                    "active_ip": cur})
         return self._send(400, {"detail": "unknown command", "command": cmd})
 
     def log_message(self, *a):   # silence stderr access-log spam
@@ -535,10 +573,15 @@ def main():
 
     # Resume the last role (and which IP we were serving) across restarts.
     resumed_active, resumed_ip = load_state()
-    if resumed_active:
-        set_active_ip(resumed_ip or SERVER_IP)
+    if resumed_active and resumed_ip:
+        set_active_ip(resumed_ip)
         active_event.set()
-        log("resumed role: ACTIVE as %s" % (resumed_ip or SERVER_IP))
+        log("resumed role: ACTIVE as %s" % resumed_ip)
+    elif resumed_active:
+        # Legacy state file with no IP recorded — do NOT guess (reporting from
+        # the wrong source IP would be rejected by the panel). Start STANDBY;
+        # the panel's self-heal re-activates us with the correct current IP.
+        log("resumed ACTIVE but no IP recorded — STANDBY until panel re-activates")
     else:
         log("resumed role: STANDBY (waiting for panel activate)")
 
