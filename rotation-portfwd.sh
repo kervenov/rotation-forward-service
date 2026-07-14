@@ -60,4 +60,32 @@ iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 
 mkdir -p /etc/iptables
 iptables-save > /etc/iptables/rules.v4
 
+# --- DNS safety net --------------------------------------------------------
+# On some providers, applying the NAT/MASQUERADE rules above leaves the box's
+# original (DHCP-provided) resolver unreachable — so the box, and the agent's
+# POSTs to the panel, can no longer resolve names. If DNS is broken right now,
+# pin public resolvers. This runs at BOOT too (portfwd.service re-applies
+# forwarding), so the fix survives reboots. Non-destructive: only acts when
+# resolution is actually failing.
+if ! getent hosts one.one.one.one >/dev/null 2>&1; then
+  echo "[!] DNS unreachable after forwarding — pinning 1.1.1.1 / 8.8.8.8"
+  # systemd-resolved boxes: set a persistent upstream via a drop-in.
+  if command -v resolvectl >/dev/null 2>&1 && [ -d /etc/systemd ]; then
+    mkdir -p /etc/systemd/resolved.conf.d
+    cat > /etc/systemd/resolved.conf.d/99-forward-fallback.conf <<'RC'
+[Resolve]
+DNS=1.1.1.1 8.8.8.8
+FallbackDNS=9.9.9.9 8.8.4.4
+RC
+    systemctl restart systemd-resolved 2>/dev/null || true
+  fi
+  # plain /etc/resolv.conf boxes: append public resolvers if missing.
+  if [ ! -L /etc/resolv.conf ]; then
+    grep -q '1\.1\.1\.1' /etc/resolv.conf 2>/dev/null || echo 'nameserver 1.1.1.1' >> /etc/resolv.conf
+    grep -q '8\.8\.8\.8' /etc/resolv.conf 2>/dev/null || echo 'nameserver 8.8.8.8' >> /etc/resolv.conf
+  fi
+  getent hosts one.one.one.one >/dev/null 2>&1 \
+    && echo "[OK] DNS restored." || echo "[!] DNS still failing — check manually."
+fi
+
 echo "[OK] Forwarding applied."
