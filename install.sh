@@ -68,13 +68,19 @@ apt_locked() {
   return 1
 }
 wait_for_apt() {
-  local i=0
+  local i=0 max=60
+  apt_locked || return 0
+  echo "[i] apt/dpkg başka bir işlemce kilitli (genelde boot sonrası unattended-upgrades)."
+  echo "    En fazla $((max*2))sn beklenip yine de denenecek (apt kendi de kilidi bekler)."
+  echo "    HIZLANDIRMAK için BAŞKA bir terminalde:"
+  echo "      sudo systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service"
   while apt_locked; do
     i=$((i+1))
-    [ "$i" -gt 90 ] && { echo "[!] dpkg 180s+ kilitli — yine de deniyorum"; return 0; }
-    echo "[*] apt/dpkg kilitli (unattended-upgrades?) bekleniyor... ($i)"
+    [ "$i" -gt "$max" ] && { echo "[!] hâlâ kilitli — yine de deniyorum"; return 0; }
+    echo "[*] kilit bekleniyor... ($i/$max)"
     sleep 2
   done
+  echo "[OK] kilit açıldı."
 }
 apt_install() {   # best-effort; returns non-zero on failure so caller can fall back
   wait_for_apt
