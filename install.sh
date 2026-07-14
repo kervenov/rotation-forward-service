@@ -60,11 +60,20 @@ export DEBIAN_FRONTEND=noninteractive
 PANEL_HOST="$(echo "$PANEL_URL" | sed -E 's#^[a-z]+://##; s#[:/].*$##')"
 
 apt_locked() {
+  # fuser is authoritative — it names the PID actually HOLDING the lock file.
+  # The always-present 'unattended-upgrade-shutdown --wait-for-signal' daemon
+  # holds NO lock, so fuser ignores it; matching it by process name (as before)
+  # false-positived forever. Only fall through to pgrep when fuser is missing.
   if command -v fuser >/dev/null 2>&1; then
-    fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && return 0
-    fuser /var/lib/apt/lists/lock    >/dev/null 2>&1 && return 0
+    fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock >/dev/null 2>&1 \
+      && return 0
+    return 1
   fi
-  pgrep -x unattended-upgr >/dev/null 2>&1 && return 0
+  # No fuser: spot an ACTIVE apt/dpkg run only — never the idle shutdown waiter.
+  for p in dpkg apt apt-get; do
+    pgrep -x "$p" >/dev/null 2>&1 && return 0
+  done
+  pgrep -f '/unattended-upgrade$' >/dev/null 2>&1 && return 0
   return 1
 }
 wait_for_apt() {
