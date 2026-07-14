@@ -149,10 +149,17 @@ sysctl -w net.netfilter.nf_conntrack_acct=1 >/dev/null 2>&1 || true
 modprobe nf_conntrack_netlink 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# 2) Port forwarding + boot service (rules unchanged)
+# 2) Fetch BOTH payloads FIRST (while DNS is pristine), THEN apply forwarding.
+#    Applying the iptables/MASQUERADE rules briefly disrupts the box's OWN
+#    outbound DNS (conntrack flush), so every network download MUST happen
+#    before this point — otherwise the agent download fails with
+#    "Could not resolve host".
 # ---------------------------------------------------------------------------
-echo "[*] Installing forwarding -> $PORTFWD_DST"
+echo "[*] Fetching payloads (before touching iptables)..."
 provide rotation-portfwd.sh "$PORTFWD_DST" 0755
+provide rotation-agent.py "$AGENT_DST" 0755
+
+echo "[*] Applying port forwarding -> $PORTFWD_DST"
 bash "$PORTFWD_DST"
 
 cat > "$PORTFWD_SERVICE" <<EOF
@@ -173,8 +180,7 @@ EOF
 # ---------------------------------------------------------------------------
 # 3) Rotation agent + service
 # ---------------------------------------------------------------------------
-echo "[*] Installing agent -> $AGENT_DST"
-provide rotation-agent.py "$AGENT_DST" 0755
+echo "[*] Configuring agent service..."
 mkdir -p /var/lib/rotation-agent
 
 # Retire the previous single-script reporter if present — the agent supersedes
