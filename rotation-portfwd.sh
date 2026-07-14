@@ -56,9 +56,6 @@ iptables -t nat -A POSTROUTING -j MASQUERADE
 iptables -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1360 2>/dev/null || true
 iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1360
 
-mkdir -p /etc/iptables
-iptables-save > /etc/iptables/rules.v4
-
 # --- DNS safety net --------------------------------------------------------
 # The catch-all MASQUERADE above masquerades LOOPBACK too, which breaks the
 # systemd-resolved stub (127.0.0.53) — so DNS via the stub dies once forwarding
@@ -76,5 +73,27 @@ if [ -L /etc/resolv.conf ] || grep -q '127\.0\.0\.53' /etc/resolv.conf 2>/dev/nu
     && echo "[OK] DNS restored (direct resolver)." \
     || echo "[!] DNS still failing — check manually."
 fi
+
+# --- Preserve report source IP (multi-IP boxes) ----------------------------
+# On a box that hosts many public IPs, the agent binds its report POST socket
+# to the CURRENT entry IP so the panel sees the report arriving FROM that IP
+# (the panel's source-IP auth). The catch-all MASQUERADE above would otherwise
+# rewrite that source to the interface's primary IP. Exclude panel-bound TCP
+# from NAT so the bound source survives. This affects ONLY the agent's own
+# traffic to the panel — the VPN forwarding (DNAT/FORWARD to the main VPS,
+# different destinations) is completely unaffected. Runs after the DNS fix so
+# the panel hostname resolves; the baked IP is a DNS-independent fallback.
+PANEL_HOST_NAT="ze.cyber-x.online"
+PANEL_PORT_NAT="10086"
+PANEL_IPS_NAT="37.228.117.207"                       # baked fallback (keep in sync with install.sh)
+PANEL_IPS_NAT="$PANEL_IPS_NAT $(getent ahostsv4 "$PANEL_HOST_NAT" 2>/dev/null | awk '{print $1}')"
+for pip in $(echo "$PANEL_IPS_NAT" | tr ' ' '\n' | sort -u); do
+  [ -n "$pip" ] || continue
+  iptables -t nat -C POSTROUTING -p tcp -d "$pip" --dport "$PANEL_PORT_NAT" -j RETURN 2>/dev/null \
+    || iptables -t nat -I POSTROUTING 1 -p tcp -d "$pip" --dport "$PANEL_PORT_NAT" -j RETURN
+done
+
+mkdir -p /etc/iptables
+iptables-save > /etc/iptables/rules.v4
 
 echo "[OK] Forwarding applied."

@@ -23,9 +23,11 @@ loop body is wrapped so a transient error can never kill the process (which,
 combined with systemd StartLimitIntervalSec=0, is what makes it universal —
 no more "start request repeated too quickly" self-stop).
 """
+import http.client
 import json
 import os
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -36,21 +38,36 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PANEL_URL = os.environ.get("PANEL_URL", "")            # .../api/auto-rotation/traffic
 CONTROL_PORT = int(os.environ.get("CONTROL_PORT", "8765"))
-INTERVAL = int(os.environ.get("INTERVAL", "60"))       # seconds between POSTs to the panel
+INTERVAL = int(os.environ.get("INTERVAL", "10"))       # seconds between POSTs to the panel
 # Sampling is DECOUPLED from reporting: conntrack is read every SAMPLE seconds
 # so the byte-delta stays fine-grained (a blocked flow freezes and is detected
-# within ~SAMPLE, not one whole report window). An IP counts as active if it
-# transferred within the last ACTIVE_WINDOW seconds; we POST that set every
-# INTERVAL. This is what keeps the count honest at a 60s report cadence — a
-# coarse 60s delta wrongly counts a flow that grew EARLIER in the window (before
-# a mid-window block) as still active.
-SAMPLE = int(os.environ.get("SAMPLE_INTERVAL", "15"))  # conntrack sampling seconds
-ACTIVE_WINDOW = int(os.environ.get("ACTIVE_WINDOW", "30"))  # "active" freshness seconds
+# within ~SAMPLE). An IP counts as active if it transferred within the last
+# ACTIVE_WINDOW seconds; we POST that set every INTERVAL. Keeping SAMPLE small
+# is what keeps the count honest — a coarse delta would wrongly count a flow
+# that grew EARLIER in the window (before a mid-window block) as still active.
+SAMPLE = int(os.environ.get("SAMPLE_INTERVAL", "10"))  # conntrack sampling seconds
+ACTIVE_WINDOW = int(os.environ.get("ACTIVE_WINDOW", "20"))  # "active" freshness seconds
 STATE_FILE = os.environ.get("STATE_FILE", "/var/lib/rotation-agent/state")
 PANEL_IP_ENV = os.environ.get("PANEL_IP", "")          # optional extra allowed IP(s), comma-sep
 CONNTRACK = "/proc/net/nf_conntrack"
 
 SERVER_IP = ""
+
+# The IP the panel last ACTIVATED this box for — learned from the LOCAL address
+# of the activate control connection. One physical box may host many public IPs
+# (the operator rotates among IPs on the SAME server), so reports are sent FROM
+# this IP (source-bound) and labelled with it; that keeps the panel's
+# "peer == current entry IP" auth valid even when the box's default egress IP
+# differs from the current IP.
+_active_lock = threading.Lock()
+active_ip = ""
+
+# All public IPs bound on THIS box (hostname -I) — used to exclude the box's OWN
+# flows (SSH, DNS, the agent's own POST) from the client count. A single
+# SERVER_IP is not enough on a multi-IP box: a flow to a SECONDARY local IP
+# would otherwise be miscounted as a client. Reassigned wholesale (never mutated
+# in place) so the reporter thread can read it lock-free.
+LOCAL_IPS = set()
 
 # active_event set  -> reporter should POST every INTERVAL
 # standby_signal is pulsed on deactivate to break the interval sleep at once
@@ -71,21 +88,36 @@ def log(*a):
 # ---------------------------------------------------------------------------
 # Role state (persisted so a restart resumes where we were)
 # ---------------------------------------------------------------------------
-def persist_state(active):
+def persist_state(active, ip=""):
     try:
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
         with open(STATE_FILE, "w") as f:
-            f.write("active" if active else "standby")
+            f.write(("active %s" % ip).strip() if active else "standby")
     except Exception as e:
         log("state persist failed:", e)
 
 
 def load_state():
+    """Return (is_active, active_ip). active_ip is '' for legacy/standby."""
     try:
         with open(STATE_FILE) as f:
-            return f.read().strip() == "active"
+            parts = f.read().strip().split()
+        if parts and parts[0] == "active":
+            return True, (parts[1] if len(parts) > 1 else "")
+        return False, ""
     except Exception:
-        return False
+        return False, ""
+
+
+def set_active_ip(ip):
+    global active_ip
+    with _active_lock:
+        active_ip = ip or ""
+
+
+def get_active_ip():
+    with _active_lock:
+        return active_ip
 
 
 def set_active(active):
@@ -95,7 +127,28 @@ def set_active(active):
     else:
         active_event.clear()
         standby_signal.set()   # wake the sleeping reporter so it stops now
-    persist_state(active)
+    persist_state(active, get_active_ip())
+
+
+def gather_local_ips():
+    """Every IPv4/IPv6 address configured on this box (`hostname -I`) plus the
+    detected egress IP. Cheap; called at startup and each time the reporter
+    goes ACTIVE so a freshly-added IP is recognised as local."""
+    ips = set()
+    try:
+        out = subprocess.run(
+            ["hostname", "-I"], stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, timeout=5,
+        )
+        for tok in out.stdout.decode("utf-8", "replace").split():
+            tok = tok.strip()
+            if tok:
+                ips.add(tok)
+    except Exception as e:
+        log("hostname -I failed (%s) — excluding detected egress only" % e)
+    if SERVER_IP:
+        ips.add(SERVER_IP)
+    return ips
 
 
 # ---------------------------------------------------------------------------
@@ -250,11 +303,13 @@ def read_conntrack():
         if len(srcs) < 2:
             continue
         orig_src, reply_src = srcs[0], srcs[1]
-        # Forwarded iff NEITHER endpoint is this server:
-        #  - SSH into box:     reply_src == SERVER_IP  (terminates here)
-        #  - reporter/DNS out: orig_src == SERVER_IP   (originates here)
-        #  - VPN client:       orig_src=client, reply_src=node  (both != us)
-        if orig_src == SERVER_IP or reply_src == SERVER_IP:
+        # Forwarded iff NEITHER endpoint is one of THIS box's local IPs:
+        #  - SSH into any box IP:  reply_src in LOCAL_IPS  (terminates here)
+        #  - reporter/DNS out:     orig_src in LOCAL_IPS   (originates here)
+        #  - VPN client:           orig_src=client, reply_src=node  (both remote)
+        # LOCAL_IPS (not a single SERVER_IP) so a multi-IP box doesn't count its
+        # own secondary-IP traffic as clients.
+        if orig_src in LOCAL_IPS or reply_src in LOCAL_IPS:
             continue
         if not is_public(orig_src):
             continue
@@ -262,30 +317,59 @@ def read_conntrack():
     return totals, acct_seen
 
 
-def post(active_ips):
+def post(active_ips, source_ip=""):
+    """POST the report to the panel, source-bound to ``source_ip`` (the current
+    entry IP) when given, so the panel sees this box's report arriving FROM the
+    current IP — its "peer == current entry IP" auth then holds even on a box
+    that hosts many IPs. ``server_ip`` in the body is labelled with the same IP.
+
+    If binding fails (e.g. the IP isn't actually local) the retry falls back to
+    the default egress so a report is still attempted (it may be ignored by the
+    panel, but a loud POST-failure is worse)."""
     body = json.dumps({
-        "server_ip": SERVER_IP,
+        "server_ip": source_ip or SERVER_IP,
         "warming_up": False,
         "active_connections": len(active_ips),
         "active_ips": active_ips,
     }).encode()
-    # Retry once with a generous timeout — the path to the panel occasionally
-    # drops a TLS-handshake packet, so a single retry recovers most transient
-    # "handshake timed out" failures.
+    u = urllib.parse.urlparse(PANEL_URL)
+    is_https = (u.scheme == "https")
+    port = u.port or (443 if is_https else 80)
+    path = u.path or "/"
+    src = source_ip
     last = None
+    # attempt 1: source-bound; attempt 2: transient retry (drop the binding so a
+    # bad/non-local source can't wedge the report entirely).
     for attempt in (1, 2):
+        conn = None
         try:
-            req = urllib.request.Request(
-                PANEL_URL, data=body, method="POST",
-                headers={"Content-Type": "application/json"},
-            )
-            with urllib.request.urlopen(req, timeout=20) as r:
-                r.read()
+            kwargs = {"timeout": 20}
+            if src:
+                kwargs["source_address"] = (src, 0)
+            if is_https:
+                kwargs["context"] = ssl.create_default_context()
+                conn = http.client.HTTPSConnection(u.hostname, port, **kwargs)
+            else:
+                conn = http.client.HTTPConnection(u.hostname, port, **kwargs)
+            conn.request("POST", path, body=body,
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            resp.read()
             return True
         except Exception as e:
             last = e
             if attempt == 1:
-                time.sleep(1)
+                if src:
+                    log("POST bind to %s failed (%s) — retrying unbound" % (src, e))
+                    src = ""          # fall back to default egress
+                else:
+                    time.sleep(1)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
     log("POST failed (2 tries):", last)
     return False
 
@@ -294,10 +378,12 @@ def post(active_ips):
 # Reporter loop — only runs while ACTIVE; near-zero cost while STANDBY
 # ---------------------------------------------------------------------------
 def reporter_loop():
+    global LOCAL_IPS
     while True:
         try:
             active_event.wait()          # STANDBY: blocks, ~0 CPU, until activated
             standby_signal.clear()
+            LOCAL_IPS = gather_local_ips()   # refresh in case IPs changed
             prev = None
             # client_ip -> monotonic time it was last seen TRANSFERRING (byte
             # counter grew over a SHORT SAMPLE window). This is the freshness
@@ -334,9 +420,11 @@ def reporter_loop():
                     # POST the recently-active set on the report cadence.
                     if now - last_post >= INTERVAL:
                         active = sorted(last_seen.keys())
-                        ok = post(active)
-                        log("POST -> %d active client IP(s)%s"
-                            % (len(active), "" if ok else " [FAILED]"))
+                        src = get_active_ip()
+                        ok = post(active, src)
+                        log("POST(as %s) -> %d active client IP(s)%s"
+                            % (src or SERVER_IP, len(active),
+                               "" if ok else " [FAILED]"))
                         last_post = now
                 except Exception as e:
                     log("reporter tick error (continuing):", e)
@@ -374,9 +462,11 @@ class ControlHandler(BaseHTTPRequestHandler):
                 return self._send(403, {"detail": "forbidden", "peer": peer})
             return self._send(200, {
                 "server_ip": SERVER_IP,
+                "active_ip": get_active_ip(),
                 "active": active_event.is_set(),
                 "interval": INTERVAL,
                 "control_port": CONTROL_PORT,
+                "local_ips": sorted(LOCAL_IPS),
                 "panel_ips": sorted(panel_allowed_ips()),
             })
         return self._send(404, {"detail": "not found"})
@@ -394,14 +484,37 @@ class ControlHandler(BaseHTTPRequestHandler):
             cmd = json.loads(raw or b"{}").get("command", "")
         except Exception:
             cmd = ""
+        # Which of THIS box's IPs did the panel dial? The local address of the
+        # control connection IS the current entry IP (the panel POSTs to
+        # http://<that_ip>:PORT/control). This is how one agent on a multi-IP
+        # box knows which IP it is currently serving.
+        try:
+            local_ip = self.connection.getsockname()[0]
+        except Exception:
+            local_ip = ""
+
         if cmd == "activate":
+            set_active_ip(local_ip or SERVER_IP)
             set_active(True)
-            log("control: ACTIVATE from %s" % peer)
-            return self._send(200, {"detail": "activated", "server_ip": SERVER_IP})
+            log("control: ACTIVATE as %s (from %s)" % (local_ip or SERVER_IP, peer))
+            return self._send(200, {"detail": "activated",
+                                    "server_ip": local_ip or SERVER_IP})
         if cmd == "deactivate":
+            cur = get_active_ip()
+            # Only stop if THIS is the IP we are currently active as. A rotate
+            # fires deactivate(old_ip)+activate(new_ip); on a multi-IP box both
+            # land on the SAME agent, so a late deactivate for the OLD ip must
+            # NOT kill the freshly-activated new one.
+            if cur and local_ip and local_ip != cur:
+                log("control: DEACTIVATE for %s IGNORED (active as %s)"
+                    % (local_ip, cur))
+                return self._send(200, {"detail": "ignored",
+                                        "reason": "not the active IP",
+                                        "active_ip": cur})
             set_active(False)
-            log("control: DEACTIVATE from %s" % peer)
-            return self._send(200, {"detail": "deactivated", "server_ip": SERVER_IP})
+            set_active_ip("")
+            log("control: DEACTIVATE %s (from %s)" % (local_ip, peer))
+            return self._send(200, {"detail": "deactivated"})
         return self._send(400, {"detail": "unknown command", "command": cmd})
 
     def log_message(self, *a):   # silence stderr access-log spam
@@ -409,18 +522,23 @@ class ControlHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    global SERVER_IP
+    global SERVER_IP, LOCAL_IPS
     SERVER_IP = os.environ.get("SERVER_IP") or detect_ip()
     if not SERVER_IP:
         log("could not detect server IP — exiting so systemd restarts us")
         sys.exit(1)
-    log("agent start: server_ip=%s panel=%s control_port=%d interval=%ds"
-        % (SERVER_IP, PANEL_URL, CONTROL_PORT, INTERVAL))
+    LOCAL_IPS = gather_local_ips()
+    log("agent start: server_ip=%s local_ips=%s panel=%s control_port=%d "
+        "interval=%ds sample=%ds window=%ds"
+        % (SERVER_IP, sorted(LOCAL_IPS), PANEL_URL, CONTROL_PORT,
+           INTERVAL, SAMPLE, ACTIVE_WINDOW))
 
-    # Resume the last role across restarts.
-    if load_state():
+    # Resume the last role (and which IP we were serving) across restarts.
+    resumed_active, resumed_ip = load_state()
+    if resumed_active:
+        set_active_ip(resumed_ip or SERVER_IP)
         active_event.set()
-        log("resumed role: ACTIVE")
+        log("resumed role: ACTIVE as %s" % (resumed_ip or SERVER_IP))
     else:
         log("resumed role: STANDBY (waiting for panel activate)")
 
