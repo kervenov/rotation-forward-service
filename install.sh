@@ -194,7 +194,8 @@ fi
 cat > "$AGENT_SERVICE" <<EOF
 [Unit]
 Description=Rotation forward-service agent (control listener + traffic reporter)
-After=network-online.target
+# Start after forwarding+DNS-net so the agent can resolve the panel at boot.
+After=network-online.target portfwd.service
 Wants=network-online.target
 # Never give up restarting — this is what makes it universal across VPS.
 StartLimitIntervalSec=0
