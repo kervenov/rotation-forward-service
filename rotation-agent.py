@@ -56,23 +56,25 @@ CONTROL_PORT = int(os.environ.get("CONTROL_PORT", "8765"))
 # flooding — it reads like an ordinary reachability check, not a scan. The entry
 # IP also rotates, so no single source pings a host forever.
 #
-# The 4 hosts are STATIC (not operator-configurable) and resolve to Turkmenistan
-# IPs on ICMP-RESPONSIVE Turkmentelecom infrastructure. Verified 2026-07-16 that
-# each answers ping FROM a working entry IP (a probe host that silently drops
-# ICMP would read as "blocked" for everyone and is useless):
-#   100haryt.com              216.250.12.107  (216.250.8.0/21)   5/5 replies
-#   turkmendemiryollary.gov.tm 95.85.108.117  (95.85.96.0/19)    5/5 replies
-#   tmcars.info                95.85.122.6    (95.85.96.0/19)    high-traffic classifieds
-#   turkmenportal.com          95.85.126.182  (95.85.96.0/19)    major news portal
-# ynamdar.com (93.171.223.25) was DROPPED — it answers 0 echoes even from a
-# healthy IP (host firewalls ICMP), so it can never be a positive signal.
+# The probe hosts are STATIC (not operator-configurable). The ONLY reliable test
+# of a good probe host is EMPIRICAL: it must go DARK (0 replies) when pinged from
+# a KNOWN-BLOCKED entry IP, yet answer from a working IP. Verified 2026-07-16 on
+# the live box (working 85.198.81.167 vs blocked 104.171.133.75):
+#   100haryt.com               216.250.12.107  working 5/5, blocked 0/5  ✓
+#   turkmendemiryollary.gov.tm 95.85.108.117   working 5/5, blocked 0/5  ✓
+#   tmcars.info                95.85.122.6     working 5/5, blocked 0/5  ✓
+# DROPPED:
+#   turkmenportal.com (95.85.126.182) — a TM IP, but an INTERNATIONAL news site
+#     reachable from OUTSIDE TM: it answered 5/5 even from the blocked IP, so it
+#     would MASK a block (reachable=any stays true). Being a TM IP is necessary
+#     but NOT sufficient — the host must be domestic-only (goes dark when blocked).
+#   ynamdar.com (93.171.223.25) — 0 echoes even from a healthy IP (firewalls ICMP).
 #
 # GUARD: each round the agent re-resolves these and DROPS any host that no longer
-# points at a Turkmenistan IP (see resolve_probe_hosts / _is_tm_ip) — e.g. a host
-# that moves behind Cloudflare. A non-TM host is anycast/global and would answer
-# even from a TM-blocked IP, masking the block, so it must never be probed.
-PROBE_HOSTS = ["100haryt.com", "turkmendemiryollary.gov.tm", "tmcars.info",
-               "turkmenportal.com"]
+# points at a Turkmenistan IP (see resolve_probe_hosts / _is_tm_ip) — e.g. one
+# that moves behind Cloudflare. That catches CDN moves; the domestic-only vetting
+# above is what catches TM-IP-but-globally-reachable sites like turkmenportal.
+PROBE_HOSTS = ["100haryt.com", "turkmendemiryollary.gov.tm", "tmcars.info"]
 PROBE_INTERVAL = int(os.environ.get("PROBE_INTERVAL", "10"))  # seconds between probe rounds
 PROBE_COUNT = int(os.environ.get("PROBE_COUNT", "5"))         # echoes per host per round (ping -c)
 PROBE_TIMEOUT = int(os.environ.get("PROBE_TIMEOUT", "2"))     # per-echo reply wait (ping -W, seconds)
