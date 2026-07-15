@@ -310,18 +310,28 @@ def _conntrack_lines():
                     pass
 
 
-def read_conntrack():
+def read_conntrack(entry_ip=""):
     """Return (totals{client_ip: bytes}, acct_seen), counting ONLY forwarded
-    (DNAT'd) flows: those where neither conntrack src= is this server. The
-    client is the FIRST src (original tuple source)."""
+    (DNAT'd) flows that dialed the CURRENT entry IP.
+
+    The client is the FIRST src (original tuple source) and the entry IP is the
+    FIRST dst (original tuple destination — the box IP the client actually
+    dialed, pre-DNAT). Filtering by ``entry_ip`` is ESSENTIAL on a box that
+    hosts many public IPs: the DNAT rules are per-PORT (``--dport 443``), so the
+    VPN is forwarded on EVERY box IP. Without this filter, clients still flowing
+    on OTHER entry IPs make a blocked current IP look alive (TM=yes forever ->
+    no rotation). With it, a blocked entry IP correctly reads ZERO."""
     totals = {}
     acct_seen = False
     for line in _conntrack_lines():
         srcs = []
+        dsts = []
         tot = 0
         for p in line.split():
             if p.startswith("src="):
                 srcs.append(p[4:])
+            elif p.startswith("dst="):
+                dsts.append(p[4:])
             elif p.startswith("bytes="):
                 acct_seen = True
                 try:
@@ -331,6 +341,13 @@ def read_conntrack():
         if len(srcs) < 2:
             continue
         orig_src, reply_src = srcs[0], srcs[1]
+        orig_dst = dsts[0] if dsts else ""
+        # Only clients that dialed the CURRENT entry IP (original dst). A box
+        # hosting many entry IPs forwards the VPN on ALL of them (per-port DNAT),
+        # so a blocked entry IP must not look alive because OTHER entry IPs still
+        # carry clients.
+        if entry_ip and orig_dst and orig_dst != entry_ip:
+            continue
         # Forwarded iff NEITHER endpoint is one of THIS box's local IPs:
         #  - SSH into any box IP:  reply_src in LOCAL_IPS  (terminates here)
         #  - reporter/DNS out:     orig_src in LOCAL_IPS   (originates here)
@@ -432,13 +449,26 @@ def reporter_loop():
             # ledger; an IP is reported active only while it stays inside
             # ACTIVE_WINDOW, so a blocked flow (frozen bytes) ages out fast.
             last_seen = {}
+            cur_entry = get_active_ip()   # the entry IP we count/report for
             last_post = time.monotonic()
-            log("ACTIVE — sampling conntrack every %ds, active-window %ds, "
-                "reporting every %ds" % (SAMPLE, ACTIVE_WINDOW, INTERVAL))
+            log("ACTIVE as %s — sampling conntrack every %ds, active-window %ds, "
+                "reporting every %ds" % (cur_entry or SERVER_IP, SAMPLE,
+                                         ACTIVE_WINDOW, INTERVAL))
             while active_event.is_set():
                 try:
                     now = time.monotonic()
-                    cur, acct = read_conntrack()
+                    entry = get_active_ip()
+                    if entry != cur_entry:
+                        # Re-activated for a DIFFERENT entry IP (rotate landed on
+                        # this same multi-IP box) — reset the delta baseline so
+                        # we don't mix two entry IPs' flow sets.
+                        cur_entry = entry
+                        prev = None
+                        last_seen = {}
+                        log("entry IP changed -> %s (baseline reset)"
+                            % (entry or SERVER_IP))
+                    # Count ONLY flows that dialed the current entry IP.
+                    cur, acct = read_conntrack(entry)
                     if not acct:
                         log("nf_conntrack_acct OFF (no bytes=) — enable: "
                             "sysctl -w net.netfilter.nf_conntrack_acct=1")
@@ -462,10 +492,9 @@ def reporter_loop():
                     # POST the recently-active set on the report cadence.
                     if now - last_post >= INTERVAL:
                         active = sorted(last_seen.keys())
-                        src = get_active_ip()
-                        ok = post(active, src)
+                        ok = post(active, entry)
                         log("POST(as %s) -> %d active client IP(s)%s"
-                            % (src or SERVER_IP, len(active),
+                            % (entry or SERVER_IP, len(active),
                                "" if ok else " [FAILED]"))
                         last_post = now
                 except Exception as e:
