@@ -47,13 +47,16 @@ INTERVAL = int(os.environ.get("INTERVAL", "10"))       # seconds between POSTs t
 # that grew EARLIER in the window (before a mid-window block) as still active.
 SAMPLE = int(os.environ.get("SAMPLE_INTERVAL", "10"))  # conntrack sampling seconds
 ACTIVE_WINDOW = int(os.environ.get("ACTIVE_WINDOW", "20"))  # "active" freshness seconds
-# A client counts as active only if it moved MORE than this many bytes in a
-# SAMPLE window. QUIC keepalives from an idle/asleep VPN (a few KB per window)
-# and blocked-but-retrying handshake noise stay BELOW it, so they are NOT
-# counted; any real usage (browsing/streaming) is far above it. This is the
-# "don't count sleeping users as active" knob. Raise it to also exclude
-# background app chatter; lower it (or 0) to count any byte growth like before.
-ACTIVE_MIN_BYTES = int(os.environ.get("ACTIVE_MIN_BYTES", "8192"))  # bytes/window
+# Minimum byte growth in a SAMPLE window for a client to count as active.
+# DEFAULT 1 = "any growth", which is the PROVEN behaviour of the old
+# forward_server_setup.sh and is CORRECT: a keepalive from an idle/asleep VPN
+# still reaching the server proves the IP is REACHABLE, so it should count (the
+# IP works). When the IP is truly BLOCKED, even keepalives can't reach -> no
+# growth -> not counted -> the count falls to 0 -> rotate. Do NOT raise this to
+# "exclude sleeping users": that would drop a reachable IP's count at night and
+# rotate a WORKING IP. Only raise it if you specifically want to ignore
+# keepalive-reachability (advanced; risks false night rotations).
+ACTIVE_MIN_BYTES = int(os.environ.get("ACTIVE_MIN_BYTES", "1"))  # bytes/window (1 = any growth)
 STATE_FILE = os.environ.get("STATE_FILE", "/var/lib/rotation-agent/state")
 PANEL_IP_ENV = os.environ.get("PANEL_IP", "")          # optional extra allowed IP(s), comma-sep
 CONNTRACK = "/proc/net/nf_conntrack"
