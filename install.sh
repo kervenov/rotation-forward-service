@@ -22,9 +22,9 @@ set -e
 PANEL_URL="https://ze.cyber-x.online:10086/api/auto-rotation/traffic"
 PANEL_IP="37.228.117.207"  # panel egress IP — control-auth works even if agent DNS is flaky
 CONTROL_PORT="8765"   # panel -> this box control endpoint (activate/deactivate)
-INTERVAL="10"         # seconds between POSTs to the panel
-SAMPLE_INTERVAL="10"  # conntrack sampling seconds — fresh byte-delta (block detection)
-ACTIVE_WINDOW="20"    # an IP counts active only if it transferred within this many seconds
+INTERVAL="15"         # seconds between POSTs to the panel
+SAMPLE_INTERVAL="15"  # conntrack sampling seconds — fresh byte-delta (block detection)
+ACTIVE_WINDOW="30"    # an IP counts active only if it transferred within this many seconds
 ACTIVE_MIN_BYTES="1"     # min byte growth/window to count active. 1 = any growth (proven old behaviour: a keepalive reaching the box proves the IP is reachable; when blocked it stops -> count 0 -> rotate). Do NOT raise to "exclude sleepers" (would rotate a working IP at night).
 
 # When run from a clone SRC_DIR holds the sibling files; when piped through

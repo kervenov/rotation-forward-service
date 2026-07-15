@@ -38,15 +38,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PANEL_URL = os.environ.get("PANEL_URL", "")            # .../api/auto-rotation/traffic
 CONTROL_PORT = int(os.environ.get("CONTROL_PORT", "8765"))
-INTERVAL = int(os.environ.get("INTERVAL", "10"))       # seconds between POSTs to the panel
+INTERVAL = int(os.environ.get("INTERVAL", "15"))       # seconds between POSTs to the panel
 # Sampling is DECOUPLED from reporting: conntrack is read every SAMPLE seconds
 # so the byte-delta stays fine-grained (a blocked flow freezes and is detected
 # within ~SAMPLE). An IP counts as active if it transferred within the last
 # ACTIVE_WINDOW seconds; we POST that set every INTERVAL. Keeping SAMPLE small
 # is what keeps the count honest — a coarse delta would wrongly count a flow
 # that grew EARLIER in the window (before a mid-window block) as still active.
-SAMPLE = int(os.environ.get("SAMPLE_INTERVAL", "10"))  # conntrack sampling seconds
-ACTIVE_WINDOW = int(os.environ.get("ACTIVE_WINDOW", "20"))  # "active" freshness seconds
+SAMPLE = int(os.environ.get("SAMPLE_INTERVAL", "15"))  # conntrack sampling seconds
+ACTIVE_WINDOW = int(os.environ.get("ACTIVE_WINDOW", "30"))  # "active" freshness seconds
 # Minimum byte growth in a SAMPLE window for a client to count as active.
 # DEFAULT 1 = "any growth", which is the PROVEN behaviour of the old
 # forward_server_setup.sh and is CORRECT: a keepalive from an idle/asleep VPN
