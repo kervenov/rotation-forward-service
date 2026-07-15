@@ -47,6 +47,13 @@ INTERVAL = int(os.environ.get("INTERVAL", "10"))       # seconds between POSTs t
 # that grew EARLIER in the window (before a mid-window block) as still active.
 SAMPLE = int(os.environ.get("SAMPLE_INTERVAL", "10"))  # conntrack sampling seconds
 ACTIVE_WINDOW = int(os.environ.get("ACTIVE_WINDOW", "20"))  # "active" freshness seconds
+# A client counts as active only if it moved MORE than this many bytes in a
+# SAMPLE window. QUIC keepalives from an idle/asleep VPN (a few KB per window)
+# and blocked-but-retrying handshake noise stay BELOW it, so they are NOT
+# counted; any real usage (browsing/streaming) is far above it. This is the
+# "don't count sleeping users as active" knob. Raise it to also exclude
+# background app chatter; lower it (or 0) to count any byte growth like before.
+ACTIVE_MIN_BYTES = int(os.environ.get("ACTIVE_MIN_BYTES", "8192"))  # bytes/window
 STATE_FILE = os.environ.get("STATE_FILE", "/var/lib/rotation-agent/state")
 PANEL_IP_ENV = os.environ.get("PANEL_IP", "")          # optional extra allowed IP(s), comma-sep
 CONNTRACK = "/proc/net/nf_conntrack"
@@ -451,9 +458,9 @@ def reporter_loop():
             last_seen = {}
             cur_entry = get_active_ip()   # the entry IP we count/report for
             last_post = time.monotonic()
-            log("ACTIVE as %s — sampling conntrack every %ds, active-window %ds, "
+            log("ACTIVE as %s — sampling every %ds, window %ds, min %dB/window, "
                 "reporting every %ds" % (cur_entry or SERVER_IP, SAMPLE,
-                                         ACTIVE_WINDOW, INTERVAL))
+                                         ACTIVE_WINDOW, ACTIVE_MIN_BYTES, INTERVAL))
             while active_event.is_set():
                 try:
                     now = time.monotonic()
@@ -479,10 +486,14 @@ def reporter_loop():
                     else:
                         # Fine-grained delta over the LAST SAMPLE only — a flow
                         # that froze (blocked) shows no growth here even if it
-                        # grew earlier, so it stops refreshing last_seen.
+                        # grew earlier, so it stops refreshing last_seen. A client
+                        # is "active" only if it moved MORE than ACTIVE_MIN_BYTES
+                        # this window — excludes idle/asleep clients (keepalive
+                        # only) and blocked-but-retrying handshake noise.
                         for ip, b in cur.items():
                             pb = prev.get(ip)
-                            if (pb is None and b > 0) or (pb is not None and b > pb):
+                            growth = b if pb is None else (b - pb)
+                            if growth >= ACTIVE_MIN_BYTES:
                                 last_seen[ip] = now
                     if acct:
                         prev = cur
