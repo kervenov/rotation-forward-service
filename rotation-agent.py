@@ -4,16 +4,18 @@
 Two jobs in one process:
 
 1. CONTROL LISTENER (always on, ~0 CPU/RAM when idle): a minimal HTTP server
-   on CONTROL_PORT that the PANEL calls to turn traffic reporting on/off:
-       POST /control {"command": "activate"}    -> start reporting
-       POST /control {"command": "deactivate"}  -> stop reporting
+   on CONTROL_PORT that the PANEL calls to turn probing on/off:
+       POST /control {"command": "activate"}    -> start probing
+       POST /control {"command": "deactivate"}  -> stop probing
    Accepted ONLY from the panel's IP (resolved from PANEL_URL). No token, no
    operator input. Forwarding (iptables DNAT/FORWARD) is NEVER touched here —
-   "deactivate" only stops the reporting loop; the box keeps forwarding.
+   "deactivate" only stops the probe loop; the box keeps forwarding.
 
-2. TRAFFIC REPORTER (gated by the active flag): while ACTIVE, every INTERVAL
-   seconds it reads conntrack, finds the client IPs that actually moved bytes
-   since the last poll, and POSTs them to the panel. While STANDBY it does
+2. REACHABILITY PROBE (gated by the active flag): while ACTIVE, every
+   PROBE_INTERVAL seconds it ICMP-pings 4 static Turkmenistan hosts FROM the
+   current entry IP (source-bound) and POSTs a ping-result report to the panel:
+   reachable=True if ANY host answered, reachable=False only when EVERY host is
+   silent (the entry IP is TM-blocked -> panel rotates). While STANDBY it does
    nothing — a reserved server sits idle until the panel activates it. This is
    why reserved boxes burn no CPU/RAM.
 
@@ -26,6 +28,7 @@ no more "start request repeated too quickly" self-stop).
 import http.client
 import json
 import os
+import shutil
 import socket
 import ssl
 import subprocess
@@ -38,30 +41,46 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PANEL_URL = os.environ.get("PANEL_URL", "")            # .../api/auto-rotation/traffic
 CONTROL_PORT = int(os.environ.get("CONTROL_PORT", "8765"))
-INTERVAL = int(os.environ.get("INTERVAL", "15"))       # seconds between POSTs to the panel
-# Sampling is DECOUPLED from reporting: conntrack is read every SAMPLE seconds
-# so the byte-delta stays fine-grained (a blocked flow freezes and is detected
-# within ~SAMPLE). An IP counts as active if it transferred within the last
-# ACTIVE_WINDOW seconds; we POST that set every INTERVAL. Keeping SAMPLE small
-# is what keeps the count honest — a coarse delta would wrongly count a flow
-# that grew EARLIER in the window (before a mid-window block) as still active.
-SAMPLE = int(os.environ.get("SAMPLE_INTERVAL", "15"))  # conntrack sampling seconds
-ACTIVE_WINDOW = int(os.environ.get("ACTIVE_WINDOW", "30"))  # "active" freshness seconds
-# Minimum byte growth in a SAMPLE window for a client to count as active.
-# DEFAULT 1 = "any growth", which is the PROVEN behaviour of the old
-# forward_server_setup.sh and is CORRECT: a keepalive from an idle/asleep VPN
-# still reaching the server proves the IP is REACHABLE, so it should count (the
-# IP works). When the IP is truly BLOCKED, even keepalives can't reach -> no
-# growth -> not counted -> the count falls to 0 -> rotate. Do NOT raise this to
-# "exclude sleeping users": that would drop a reachable IP's count at night and
-# rotate a WORKING IP. Only raise it if you specifically want to ignore
-# keepalive-reachability (advanced; risks false night rotations).
-ACTIVE_MIN_BYTES = int(os.environ.get("ACTIVE_MIN_BYTES", "1"))  # bytes/window (1 = any growth)
+
+# ── Probe (reachability) model ─────────────────────────────────────────────
+# The agent no longer inspects VPN traffic. Instead it periodically ICMP-pings
+# well-known Turkmenistan hosts FROM the current entry IP and asks: can this IP
+# still reach TM? If the entry IP is TM-blocked the echoes never come back. When
+# EVERY host is unreachable the IP is considered blocked and the panel is told
+# to rotate. Probing 4 independent hosts means one host merely being down can't
+# trigger a rotation — a block is only declared when ALL 4 go silent.
+#
+# Kept low-profile on purpose (operator: don't let telecom.tm notice and close
+# ICMP): a short burst of a few echoes per round, default packet size, no
+# flooding — it reads like an ordinary reachability check, not a scan. The entry
+# IP also rotates, so no single source pings a host forever.
+#
+# The 4 hosts are STATIC (not operator-configurable) and resolve to Turkmenistan
+# IPs on ICMP-RESPONSIVE Turkmentelecom infrastructure. Verified 2026-07-16 that
+# each answers ping FROM a working entry IP (a probe host that silently drops
+# ICMP would read as "blocked" for everyone and is useless):
+#   100haryt.com              216.250.12.107  (216.250.8.0/21)   5/5 replies
+#   turkmendemiryollary.gov.tm 95.85.108.117  (95.85.96.0/19)    5/5 replies
+#   tmcars.info                95.85.122.6    (95.85.96.0/19)    high-traffic classifieds
+#   turkmenportal.com          95.85.126.182  (95.85.96.0/19)    major news portal
+# ynamdar.com (93.171.223.25) was DROPPED — it answers 0 echoes even from a
+# healthy IP (host firewalls ICMP), so it can never be a positive signal.
+PROBE_HOSTS = ["100haryt.com", "turkmendemiryollary.gov.tm", "tmcars.info",
+               "turkmenportal.com"]
+PROBE_INTERVAL = int(os.environ.get("PROBE_INTERVAL", "10"))  # seconds between probe rounds
+PROBE_COUNT = int(os.environ.get("PROBE_COUNT", "5"))         # echoes per host per round (ping -c)
+PROBE_TIMEOUT = int(os.environ.get("PROBE_TIMEOUT", "2"))     # per-echo reply wait (ping -W, seconds)
+
 STATE_FILE = os.environ.get("STATE_FILE", "/var/lib/rotation-agent/state")
 PANEL_IP_ENV = os.environ.get("PANEL_IP", "")          # optional extra allowed IP(s), comma-sep
-CONNTRACK = "/proc/net/nf_conntrack"
 
 SERVER_IP = ""
+
+# Resolved probe-host IPs, refreshed off the panel-independent default resolver
+# (DNS is NOT source-bound, so it works even when the entry IP is blocked). We
+# connect to the cached IPs so a transient DNS blip can't look like a block.
+_probe_ips_lock = threading.Lock()
+_probe_ips = {}          # host -> ip (last good)
 
 # The IP the panel last ACTIVATED this box for — learned from the LOCAL address
 # of the activate control connection. One physical box may host many public IPs
@@ -72,14 +91,7 @@ SERVER_IP = ""
 _active_lock = threading.Lock()
 active_ip = ""
 
-# All public IPs bound on THIS box (hostname -I) — used to exclude the box's OWN
-# flows (SSH, DNS, the agent's own POST) from the client count. A single
-# SERVER_IP is not enough on a multi-IP box: a flow to a SECONDARY local IP
-# would otherwise be miscounted as a client. Reassigned wholesale (never mutated
-# in place) so the reporter thread can read it lock-free.
-LOCAL_IPS = set()
-
-# active_event set  -> reporter should POST every INTERVAL
+# active_event set  -> probe loop should run every PROBE_INTERVAL
 # standby_signal is pulsed on deactivate to break the interval sleep at once
 active_event = threading.Event()
 standby_signal = threading.Event()
@@ -168,27 +180,6 @@ def deactivate_for(local_ip):
     return True
 
 
-def gather_local_ips():
-    """Every IPv4/IPv6 address configured on this box (`hostname -I`) plus the
-    detected egress IP. Cheap; called at startup and each time the reporter
-    goes ACTIVE so a freshly-added IP is recognised as local."""
-    ips = set()
-    try:
-        out = subprocess.run(
-            ["hostname", "-I"], stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, timeout=5,
-        )
-        for tok in out.stdout.decode("utf-8", "replace").split():
-            tok = tok.strip()
-            if tok:
-                ips.add(tok)
-    except Exception as e:
-        log("hostname -I failed (%s) — excluding detected egress only" % e)
-    if SERVER_IP:
-        ips.add(SERVER_IP)
-    return ips
-
-
 # ---------------------------------------------------------------------------
 # IP helpers
 # ---------------------------------------------------------------------------
@@ -207,33 +198,6 @@ def detect_ip(retries=20, delay=3):
             pass
         time.sleep(delay)
     return ""
-
-
-def is_public_v4(ip):
-    o = ip.split(".")
-    if len(o) != 4:
-        return False
-    try:
-        a, b = int(o[0]), int(o[1])
-    except ValueError:
-        return False
-    if a in (10, 127, 0) or a >= 224:
-        return False
-    if a == 192 and b == 168:
-        return False
-    if a == 172 and 16 <= b <= 31:
-        return False
-    if a == 169 and b == 254:
-        return False
-    if a == 100 and 64 <= b <= 127:   # CGNAT
-        return False
-    return True
-
-
-def is_public(ip):
-    if ":" in ip:
-        return not (ip == "::1" or ip.lower().startswith("fe80"))
-    return is_public_v4(ip)
 
 
 def _panel_host():
@@ -278,122 +242,126 @@ def panel_allowed_ips():
 
 
 # ---------------------------------------------------------------------------
-# conntrack — count ONLY forwarded (DNAT'd) VPN flows, active-by-byte-delta
+# Probe — is the CURRENT entry IP still able to reach Turkmenistan?
 # ---------------------------------------------------------------------------
-def _conntrack_lines():
-    """Yield conntrack table lines. Prefer /proc/net/nf_conntrack (lightest);
-    on kernels with CONFIG_NF_CONNTRACK_PROCFS disabled that file is absent,
-    so stream `conntrack -L` (conntrack-tools) line by line — streaming keeps
-    memory flat even when the table has hundreds of thousands of flows."""
+def resolve_probe_hosts():
+    """Resolve the 4 static TM probe hosts to IPv4 and cache them. DNS is NOT
+    source-bound (it goes out the default resolver, which we keep working even
+    when the entry IP is blocked), so resolution keeps succeeding regardless of
+    the entry IP's reachability. On a resolve failure we keep the last-good IP
+    so a DNS blip can't masquerade as a block. Returns {host: ip}."""
+    global _probe_ips
+    resolved = {}
+    with _probe_ips_lock:
+        last_good = dict(_probe_ips)
+    for host in PROBE_HOSTS:
+        ip = ""
+        try:
+            for res in socket.getaddrinfo(host, None, socket.AF_INET):
+                ip = res[4][0]
+                break
+        except Exception as e:
+            log("probe DNS resolve failed for %s: %s" % (host, e))
+        if not ip:
+            ip = last_good.get(host, "")   # fall back to last-good
+        if ip:
+            resolved[host] = ip
+    if resolved:
+        with _probe_ips_lock:
+            _probe_ips = resolved
+    return resolved
+
+
+def ping_host(target_ip, source_ip=""):
+    """Send ICMP echoes to ``target_ip`` and return True if ANY reply comes
+    back. We ask for up to PROBE_COUNT packets (``ping -c``) and treat even a
+    single reply as "reachable" — one packet returning proves the entry IP can
+    still get to Turkmenistan, and asking for several makes a couple of random
+    drops harmless (no false "blocked"). Bound to ``source_ip`` (``ping -I``) so
+    it tests the CURRENT entry IP specifically, not the box's default egress.
+
+    Kept deliberately low-profile: a short burst of a few echoes every round,
+    default packet size — it reads like an ordinary reachability check, not a
+    scan, so a monitored host (telecom.tm) is unlikely to treat it as hostile."""
+    cmd = ["ping", "-n", "-c", str(PROBE_COUNT), "-W", str(PROBE_TIMEOUT)]
+    if source_ip:
+        cmd += ["-I", source_ip]
+    cmd.append(target_ip)
+    # Hard wall-clock cap so a black-holed host (echoes sent, nothing ever
+    # returns) can't hang the round: ping itself waits at most
+    # PROBE_COUNT * PROBE_TIMEOUT, we allow a little slack on top.
+    deadline = PROBE_COUNT * PROBE_TIMEOUT + 5
     try:
-        with open(CONNTRACK, "r") as f:
-            for line in f:
-                yield line
-        return
-    except FileNotFoundError:
-        pass
-    p = None
-    try:
-        p = subprocess.Popen(
-            ["conntrack", "-L"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        r = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=deadline,
         )
-        for raw in p.stdout:
-            yield raw.decode("utf-8", "replace")
+        # ping exits 0 iff at least one echo was answered.
+        return r.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
     except FileNotFoundError:
-        log("conntrack command missing — install conntrack-tools "
-            "(apt install -y conntrack)")
+        log("ping binary missing — install iputils-ping (apt install -y iputils-ping)")
+        return False
     except Exception as e:
-        log("conntrack -L failed:", e)
-    finally:
-        if p is not None:
-            try:
-                p.stdout.close()
-            except Exception:
-                pass
-            try:
-                p.wait(timeout=5)
-            except Exception:
-                try:
-                    p.kill()
-                except Exception:
-                    pass
+        log("ping error for %s: %s" % (target_ip, e))
+        return False
 
 
-def read_conntrack(entry_ip=""):
-    """Return (totals{client_ip: bytes}, acct_seen), counting ONLY forwarded
-    (DNAT'd) flows that dialed the CURRENT entry IP.
+def probe_reachable(source_ip=""):
+    """Probe all 4 TM hosts (in parallel) from ``source_ip`` and return
+    (reachable, detail). reachable is True if ANY host answered; it is False
+    ONLY when EVERY host is unreachable — the signal that the current entry IP
+    is TM-blocked. Probing 4 independent hosts means one host being down (not a
+    block) can't trigger a rotation: the others still answer."""
+    if shutil.which("ping") is None:
+        # No ping binary — treat as reachable (fail-safe): a missing tool is a
+        # LOCAL fault, not a TM block, and must never rotate-storm the whole
+        # pool. Self-heals the moment iputils-ping is installed.
+        log("probe: ping binary not found — assuming reachable (fail-safe); "
+            "install iputils-ping")
+        return True, {}
+    hosts = resolve_probe_hosts()
+    if not hosts:
+        # Couldn't resolve ANY probe host — treat as reachable (fail-safe): a
+        # total DNS outage must not be mistaken for a TM block and rotate a
+        # working IP. This is rare and self-heals on the next round.
+        log("probe: no host resolved — assuming reachable (fail-safe)")
+        return True, {}
+    results = {}
+    threads = []
 
-    The client is the FIRST src (original tuple source) and the entry IP is the
-    FIRST dst (original tuple destination — the box IP the client actually
-    dialed, pre-DNAT). Filtering by ``entry_ip`` is ESSENTIAL on a box that
-    hosts many public IPs: the DNAT rules are per-PORT (``--dport 443``), so the
-    VPN is forwarded on EVERY box IP. Without this filter, clients still flowing
-    on OTHER entry IPs make a blocked current IP look alive (TM=yes forever ->
-    no rotation). With it, a blocked entry IP correctly reads ZERO."""
-    totals = {}
-    acct_seen = False
-    for line in _conntrack_lines():
-        srcs = []
-        dsts = []
-        byte_fields = []
-        for p in line.split():
-            if p.startswith("src="):
-                srcs.append(p[4:])
-            elif p.startswith("dst="):
-                dsts.append(p[4:])
-            elif p.startswith("bytes="):
-                acct_seen = True
-                try:
-                    byte_fields.append(int(p[6:]))
-                except ValueError:
-                    pass
-        if len(srcs) < 2:
-            continue
-        orig_src, reply_src = srcs[0], srcs[1]
-        orig_dst = dsts[0] if dsts else ""
-        # ORIGINAL (client -> server) bytes ONLY = the client actually SENDING
-        # to this IP. This is the sole proof the client can REACH the IP. Do NOT
-        # add the reply direction (node -> server): when TM blocks the entry IP
-        # the client can't send (this freezes) BUT the node keeps blasting the
-        # reply — the fork's Brutal congestion control sends at a FIXED RATE
-        # regardless of ACKs, so a blocked client's reply bytes keep growing.
-        # Summing both would count a blocked client as active forever.
-        orig_bytes = byte_fields[0] if byte_fields else 0
-        # Only clients that dialed the CURRENT entry IP (original dst). A box
-        # hosting many entry IPs forwards the VPN on ALL of them (per-port DNAT),
-        # so a blocked entry IP must not look alive because OTHER entry IPs still
-        # carry clients.
-        if entry_ip and orig_dst and orig_dst != entry_ip:
-            continue
-        # Forwarded iff NEITHER endpoint is one of THIS box's local IPs:
-        #  - SSH into any box IP:  reply_src in LOCAL_IPS  (terminates here)
-        #  - reporter/DNS out:     orig_src in LOCAL_IPS   (originates here)
-        #  - VPN client:           orig_src=client, reply_src=node  (both remote)
-        # LOCAL_IPS (not a single SERVER_IP) so a multi-IP box doesn't count its
-        # own secondary-IP traffic as clients.
-        if orig_src in LOCAL_IPS or reply_src in LOCAL_IPS:
-            continue
-        if not is_public(orig_src):
-            continue
-        totals[orig_src] = totals.get(orig_src, 0) + orig_bytes
-    return totals, acct_seen
+    def _run(h, ip):
+        results[h] = ping_host(ip, source_ip)
+
+    for host, ip in hosts.items():
+        t = threading.Thread(target=_run, args=(host, ip), daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join(PROBE_COUNT * PROBE_TIMEOUT + 8)
+    reachable = any(results.values())
+    return reachable, results
 
 
-def post(active_ips, source_ip=""):
-    """POST the report to the panel, source-bound to ``source_ip`` (the current
-    entry IP) when given, so the panel sees this box's report arriving FROM the
-    current IP — its "peer == current entry IP" auth then holds even on a box
-    that hosts many IPs. ``server_ip`` in the body is labelled with the same IP.
+def post(reachable, source_ip="", detail=None):
+    """POST the PING-RESULT report to the panel, source-bound to ``source_ip``
+    (the current entry IP) when given, so the panel sees the report arriving
+    FROM the current IP — its "peer == current entry IP" auth then holds even on
+    a box that hosts many IPs. ``server_ip`` in the body is labelled with the
+    same IP.
+
+    ``reachable`` is the whole signal: True = the current entry IP can still
+    reach at least one TM host; False = every TM host was silent (blocked) ->
+    the panel should rotate. ``per_host`` is included for the panel log only.
 
     If binding fails (e.g. the IP isn't actually local) the retry falls back to
     the default egress so a report is still attempted (it may be ignored by the
     panel, but a loud POST-failure is worse)."""
     body = json.dumps({
         "server_ip": source_ip or SERVER_IP,
-        "warming_up": False,
-        "active_connections": len(active_ips),
-        "active_ips": active_ips,
+        "reachable": bool(reachable),
+        "per_host": detail or {},
     }).encode()
     u = urllib.parse.urlparse(PANEL_URL)
     is_https = (u.scheme == "https")
@@ -452,81 +420,46 @@ def post(active_ips, source_ip=""):
 
 
 # ---------------------------------------------------------------------------
-# Reporter loop — only runs while ACTIVE; near-zero cost while STANDBY
+# Probe loop — only runs while ACTIVE; near-zero cost while STANDBY
 # ---------------------------------------------------------------------------
-def reporter_loop():
-    global LOCAL_IPS
+def probe_loop():
     while True:
         try:
             active_event.wait()          # STANDBY: blocks, ~0 CPU, until activated
             standby_signal.clear()
-            LOCAL_IPS = gather_local_ips()   # refresh in case IPs changed
-            prev = None
-            # client_ip -> monotonic time it was last seen TRANSFERRING (byte
-            # counter grew over a SHORT SAMPLE window). This is the freshness
-            # ledger; an IP is reported active only while it stays inside
-            # ACTIVE_WINDOW, so a blocked flow (frozen bytes) ages out fast.
-            last_seen = {}
-            cur_entry = get_active_ip()   # the entry IP we count/report for
-            last_post = time.monotonic()
-            log("ACTIVE as %s — sampling every %ds, window %ds, min %dB/window, "
-                "reporting every %ds" % (cur_entry or SERVER_IP, SAMPLE,
-                                         ACTIVE_WINDOW, ACTIVE_MIN_BYTES, INTERVAL))
+            entry = get_active_ip()
+            log("ACTIVE as %s — probing %d TM hosts every ~%ds "
+                "(%d echoes/host, %ds reply wait), source-bound to the entry IP"
+                % (entry or SERVER_IP, len(PROBE_HOSTS), PROBE_INTERVAL,
+                   PROBE_COUNT, PROBE_TIMEOUT))
+            resolve_probe_hosts()        # warm the DNS cache before the first probe
+            # Probe IMMEDIATELY on activation (no initial sleep) so a freshly
+            # activated IP is verified at once; then hold a ~PROBE_INTERVAL
+            # start-to-start cadence (the probe itself takes a few seconds).
             while active_event.is_set():
+                t0 = time.monotonic()
                 try:
-                    now = time.monotonic()
                     entry = get_active_ip()
-                    if entry != cur_entry:
-                        # Re-activated for a DIFFERENT entry IP (rotate landed on
-                        # this same multi-IP box) — reset the delta baseline so
-                        # we don't mix two entry IPs' flow sets.
-                        cur_entry = entry
-                        prev = None
-                        last_seen = {}
-                        log("entry IP changed -> %s (baseline reset)"
-                            % (entry or SERVER_IP))
-                    # Count ONLY flows that dialed the current entry IP.
-                    cur, acct = read_conntrack(entry)
-                    if not acct:
-                        log("nf_conntrack_acct OFF (no bytes=) — enable: "
-                            "sysctl -w net.netfilter.nf_conntrack_acct=1")
-                    elif prev is None:
-                        # first sample: establish the byte baseline (no delta
-                        # to compare yet).
-                        log("baseline established")
-                    else:
-                        # Fine-grained delta over the LAST SAMPLE only — a flow
-                        # that froze (blocked) shows no growth here even if it
-                        # grew earlier, so it stops refreshing last_seen. A client
-                        # is "active" only if it moved MORE than ACTIVE_MIN_BYTES
-                        # this window — excludes idle/asleep clients (keepalive
-                        # only) and blocked-but-retrying handshake noise.
-                        for ip, b in cur.items():
-                            pb = prev.get(ip)
-                            growth = b if pb is None else (b - pb)
-                            if growth >= ACTIVE_MIN_BYTES:
-                                last_seen[ip] = now
-                    if acct:
-                        prev = cur
-                    # Age out anyone not seen transferring within ACTIVE_WINDOW.
-                    last_seen = {ip: t for ip, t in last_seen.items()
-                                 if now - t <= ACTIVE_WINDOW}
-                    # POST the recently-active set on the report cadence.
-                    if now - last_post >= INTERVAL:
-                        active = sorted(last_seen.keys())
-                        ok = post(active, entry)
-                        log("POST(as %s) -> %d active client IP(s)%s"
-                            % (entry or SERVER_IP, len(active),
-                               "" if ok else " [FAILED]"))
-                        last_post = now
+                    reachable, detail = probe_reachable(entry)
+                    ok = post(reachable, entry, detail)
+                    summary = ", ".join(
+                        "%s=%s" % (h, "up" if v else "DOWN")
+                        for h, v in detail.items()) or "no-hosts-resolved"
+                    log("PROBE(as %s) reachable=%s [%s] -> POST%s"
+                        % (entry or SERVER_IP, reachable, summary,
+                           "" if ok else " [FAILED]"))
                 except Exception as e:
-                    log("reporter tick error (continuing):", e)
-                # Sleep the SHORT sampling interval, wake at once if deactivated.
-                if standby_signal.wait(SAMPLE):
+                    log("probe tick error (continuing):", e)
+                # Hold the cadence: sleep whatever's left of PROBE_INTERVAL after
+                # the probe's own duration (floor 1s), waking at once on deactivate.
+                wait = PROBE_INTERVAL - (time.monotonic() - t0)
+                if wait < 1:
+                    wait = 1
+                if standby_signal.wait(wait):
                     break
-            log("STANDBY — traffic reports stopped (forwarding untouched)")
+            log("STANDBY — probing stopped (forwarding untouched)")
         except Exception as e:
-            log("reporter loop error (restarting loop):", e)
+            log("probe loop error (restarting loop):", e)
             time.sleep(2)
 
 
@@ -557,9 +490,10 @@ class ControlHandler(BaseHTTPRequestHandler):
                 "server_ip": SERVER_IP,
                 "active_ip": get_active_ip(),
                 "active": active_event.is_set(),
-                "interval": INTERVAL,
+                "probe_interval": PROBE_INTERVAL,
+                "probe_hosts": PROBE_HOSTS,
+                "probe_ips": _probe_ips,
                 "control_port": CONTROL_PORT,
-                "local_ips": sorted(LOCAL_IPS),
                 "panel_ips": sorted(panel_allowed_ips()),
             })
         return self._send(404, {"detail": "not found"})
@@ -611,16 +545,15 @@ class ControlHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    global SERVER_IP, LOCAL_IPS
+    global SERVER_IP
     SERVER_IP = os.environ.get("SERVER_IP") or detect_ip()
     if not SERVER_IP:
         log("could not detect server IP — exiting so systemd restarts us")
         sys.exit(1)
-    LOCAL_IPS = gather_local_ips()
-    log("agent start: server_ip=%s local_ips=%s panel=%s control_port=%d "
-        "interval=%ds sample=%ds window=%ds"
-        % (SERVER_IP, sorted(LOCAL_IPS), PANEL_URL, CONTROL_PORT,
-           INTERVAL, SAMPLE, ACTIVE_WINDOW))
+    log("agent start: server_ip=%s panel=%s control_port=%d "
+        "probe_interval=%ds probe_count=%d probe_timeout=%ds hosts=%s"
+        % (SERVER_IP, PANEL_URL, CONTROL_PORT, PROBE_INTERVAL,
+           PROBE_COUNT, PROBE_TIMEOUT, PROBE_HOSTS))
 
     # Resume the last role (and which IP we were serving) across restarts.
     resumed_active, resumed_ip = load_state()
@@ -636,7 +569,7 @@ def main():
     else:
         log("resumed role: STANDBY (waiting for panel activate)")
 
-    threading.Thread(target=reporter_loop, daemon=True).start()
+    threading.Thread(target=probe_loop, daemon=True).start()
 
     while True:
         try:

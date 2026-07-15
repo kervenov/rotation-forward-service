@@ -7,15 +7,19 @@ crash-proof Python daemon (stdlib only) plus the port-forwarding rules.
 - **Control listener** — a minimal HTTP endpoint the panel calls to
   `activate` / `deactivate` this box. Accepted **only from the panel's IP**
   (no token, no operator input).
-- **Traffic reporter** — while **ACTIVE**, it samples conntrack every
-  `SAMPLE_INTERVAL` seconds (fine-grained byte-delta) and POSTs to the panel
-  every `INTERVAL` seconds the client IPs that actually moved bytes within the
-  last `ACTIVE_WINDOW` seconds. Sampling is decoupled from reporting so a
-  blocked flow (frozen bytes) is detected within ~`SAMPLE_INTERVAL`, not a whole
-  report window. While **STANDBY** it does nothing → reserved boxes burn ~0
-  CPU/RAM.
+- **Reachability probe** — while **ACTIVE**, every `PROBE_INTERVAL` seconds it
+  ICMP-pings **4 static Turkmenistan hosts** (`100haryt.com`,
+  `turkmendemiryollary.gov.tm`, `tmcars.info`, `turkmenportal.com`) **from the
+  current entry IP** (source-bound, so it tests *that* IP even on a box hosting
+  many) and POSTs the verdict to the panel: `reachable=true` if **any** host
+  answered, `reachable=false` only when **every** host is silent — i.e. the
+  entry IP is TM-blocked, so the panel rotates. Probing 4 independent hosts ×
+  `PROBE_COUNT` echoes means transient loss or one host being down can't force a
+  rotation. Kept low-profile (a short echo burst, no flooding) so a monitored
+  host doesn't treat it as a scan. While **STANDBY** it does nothing → reserved
+  boxes burn ~0 CPU/RAM.
 
-`deactivate` stops **only** the reporting loop — forwarding keeps running.
+`deactivate` stops **only** the probe loop — forwarding keeps running.
 
 ## How the panel drives it
 
@@ -47,7 +51,7 @@ agent up **STANDBY** — no prompts, no token. It waits for the panel to
 git clone https://github.com/kervenov/rotation-forward-service.git
 cd rotation-forward-service
 # optional: edit the port->main-VPS map in rotation-portfwd.sh and the config
-# block (PANEL_URL / CONTROL_PORT / INTERVAL) at the top of install.sh
+# block (PANEL_URL / CONTROL_PORT / PROBE_INTERVAL) at the top of install.sh
 sudo bash install.sh
 ```
 </details>
@@ -56,16 +60,18 @@ sudo bash install.sh
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `PANEL_URL` | `https://ze.cyber-x.online:10086/api/auto-rotation/traffic` | Where reports are POSTed. Its host also defines the only IP allowed to send control commands. |
+| `PANEL_URL` | `https://ze.cyber-x.online:10086/api/auto-rotation/traffic` | Where ping-result reports are POSTed. Its host also defines the only IP allowed to send control commands. |
 | `CONTROL_PORT` | `8765` | Inbound activate/deactivate endpoint. Not in the DNAT map, so it's delivered locally. |
-| `INTERVAL` | `60` | Seconds between reports while ACTIVE. |
+| `PROBE_INTERVAL` | `10` | Seconds between probe rounds while ACTIVE. |
+| `PROBE_COUNT` | `5` | ICMP echoes per host per round (`ping -c`); reachable if ANY returns. |
+| `PROBE_TIMEOUT` | `2` | Per-echo reply wait (`ping -W`, seconds). |
 | `PANEL_IP` | *(empty)* | Optional extra allowed control-source IP(s), comma-separated (e.g. if the panel egresses from a different IP than its DNS). |
 
 ## Operate
 
 ```bash
-journalctl -u rotation-agent -f                 # live log
-curl -s http://127.0.0.1:8765/health            # {active, interval, panel_ips, ...}
+journalctl -u rotation-agent -f                 # live log (PROBE lines: reachable=… per-host up/DOWN)
+curl -s http://127.0.0.1:8765/health            # {active, probe_interval, probe_hosts, probe_ips, ...}
 systemctl status rotation-agent portfwd         # service state
 ```
 
@@ -73,6 +79,6 @@ systemctl status rotation-agent portfwd         # service state
 
 | File | Role |
 |------|------|
-| `rotation-agent.py` | The daemon: control listener + gated traffic reporter. |
+| `rotation-agent.py` | The daemon: control listener + gated reachability probe. |
 | `rotation-portfwd.sh` | Port forwarding rules (edit `rules` for this box). Boot-persistent via `portfwd.service`. |
 | `install.sh` | Turnkey installer — deps, both services, no input. |
