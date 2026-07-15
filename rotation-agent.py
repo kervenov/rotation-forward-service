@@ -336,7 +336,7 @@ def read_conntrack(entry_ip=""):
     for line in _conntrack_lines():
         srcs = []
         dsts = []
-        tot = 0
+        byte_fields = []
         for p in line.split():
             if p.startswith("src="):
                 srcs.append(p[4:])
@@ -345,13 +345,21 @@ def read_conntrack(entry_ip=""):
             elif p.startswith("bytes="):
                 acct_seen = True
                 try:
-                    tot += int(p[6:])
+                    byte_fields.append(int(p[6:]))
                 except ValueError:
                     pass
         if len(srcs) < 2:
             continue
         orig_src, reply_src = srcs[0], srcs[1]
         orig_dst = dsts[0] if dsts else ""
+        # ORIGINAL (client -> server) bytes ONLY = the client actually SENDING
+        # to this IP. This is the sole proof the client can REACH the IP. Do NOT
+        # add the reply direction (node -> server): when TM blocks the entry IP
+        # the client can't send (this freezes) BUT the node keeps blasting the
+        # reply — the fork's Brutal congestion control sends at a FIXED RATE
+        # regardless of ACKs, so a blocked client's reply bytes keep growing.
+        # Summing both would count a blocked client as active forever.
+        orig_bytes = byte_fields[0] if byte_fields else 0
         # Only clients that dialed the CURRENT entry IP (original dst). A box
         # hosting many entry IPs forwards the VPN on ALL of them (per-port DNAT),
         # so a blocked entry IP must not look alive because OTHER entry IPs still
@@ -368,7 +376,7 @@ def read_conntrack(entry_ip=""):
             continue
         if not is_public(orig_src):
             continue
-        totals[orig_src] = totals.get(orig_src, 0) + tot
+        totals[orig_src] = totals.get(orig_src, 0) + orig_bytes
     return totals, acct_seen
 
 
