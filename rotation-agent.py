@@ -26,6 +26,7 @@ combined with systemd StartLimitIntervalSec=0, is what makes it universal —
 no more "start request repeated too quickly" self-stop).
 """
 import http.client
+import ipaddress
 import json
 import os
 import shutil
@@ -65,6 +66,11 @@ CONTROL_PORT = int(os.environ.get("CONTROL_PORT", "8765"))
 #   turkmenportal.com          95.85.126.182  (95.85.96.0/19)    major news portal
 # ynamdar.com (93.171.223.25) was DROPPED — it answers 0 echoes even from a
 # healthy IP (host firewalls ICMP), so it can never be a positive signal.
+#
+# GUARD: each round the agent re-resolves these and DROPS any host that no longer
+# points at a Turkmenistan IP (see resolve_probe_hosts / _is_tm_ip) — e.g. a host
+# that moves behind Cloudflare. A non-TM host is anycast/global and would answer
+# even from a TM-blocked IP, masking the block, so it must never be probed.
 PROBE_HOSTS = ["100haryt.com", "turkmendemiryollary.gov.tm", "tmcars.info",
                "turkmenportal.com"]
 PROBE_INTERVAL = int(os.environ.get("PROBE_INTERVAL", "10"))  # seconds between probe rounds
@@ -244,6 +250,34 @@ def panel_allowed_ips():
 # ---------------------------------------------------------------------------
 # Probe — is the CURRENT entry IP still able to reach Turkmenistan?
 # ---------------------------------------------------------------------------
+# Turkmenistan IPv4 blocks — MIRRORS the panel's app/utils/tm_ip.py
+# (ipdeny tm-aggregated.zone). A probe host is only trusted if it resolves
+# INTO one of these: a host that has moved behind a global CDN (Cloudflare's
+# orange cloud etc.) would resolve to an anycast edge reachable from anywhere,
+# so it would answer even when the entry IP is TM-blocked and MASK the block.
+# Keep in sync with the panel list.
+_TM_CIDRS = [
+    "77.83.59.0/24", "95.85.96.0/19", "103.220.0.0/22", "119.235.112.0/20",
+    "177.93.143.0/24", "185.69.184.0/22", "185.246.72.0/22",
+    "194.117.52.192/26", "216.250.8.0/21", "217.65.78.0/24", "217.174.224.0/20",
+]
+_TM_NETS = []
+for _c in _TM_CIDRS:
+    try:
+        _TM_NETS.append(ipaddress.ip_network(_c))
+    except ValueError:
+        pass
+
+
+def _is_tm_ip(ip):
+    """True iff ``ip`` falls inside a Turkmenistan block. Non-IP -> False."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in _TM_NETS)
+
+
 def resolve_probe_hosts():
     """Resolve the 4 static TM probe hosts to IPv4 and cache them. DNS is NOT
     source-bound (it goes out the default resolver, which we keep working even
@@ -262,8 +296,18 @@ def resolve_probe_hosts():
                 break
         except Exception as e:
             log("probe DNS resolve failed for %s: %s" % (host, e))
+        if ip and not _is_tm_ip(ip):
+            # Host no longer resolves to a Turkmenistan IP — most likely moved
+            # behind a global CDN (Cloudflare). Such a host is anycast/global and
+            # would answer even from a TM-blocked entry IP, MASKING the block, so
+            # it is DROPPED (not cached, not reused). The other hosts still probe;
+            # if EVERY host drops, resolve returns empty -> probe_reachable
+            # fail-safes to reachable (never a false rotate).
+            log("probe host %s -> non-TM IP %s (CDN/Cloudflare?) — SKIPPING so it "
+                "can't mask a block; replace this host" % (host, ip))
+            continue
         if not ip:
-            ip = last_good.get(host, "")   # fall back to last-good
+            ip = last_good.get(host, "")   # DNS blip: reuse last validated TM IP
         if ip:
             resolved[host] = ip
     if resolved:
