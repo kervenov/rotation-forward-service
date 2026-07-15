@@ -56,27 +56,11 @@ CONTROL_PORT = int(os.environ.get("CONTROL_PORT", "8765"))
 # flooding — it reads like an ordinary reachability check, not a scan. The entry
 # IP also rotates, so no single source pings a host forever.
 #
-# The probe hosts are STATIC (not operator-configurable). The ONLY reliable test
-# of a good probe host is EMPIRICAL: it must go DARK (0 replies) when pinged from
-# a KNOWN-BLOCKED entry IP, yet answer from a working IP. Verified 2026-07-16 on
-# the live box (working 85.198.81.167 vs blocked 104.171.133.75):
-#   100haryt.com               216.250.12.107  working 5/5, blocked 0/5  ✓
-#   turkmendemiryollary.gov.tm 95.85.108.117   working 5/5, blocked 0/5  ✓
-#   tmcars.info                95.85.122.6     working 5/5, blocked 0/5  ✓
-#   e.gov.tm                   217.174.238.99  working 5/5, blocked 0/5  ✓  (distinct /20)
-# Vetted spares (all working 5/5, blocked 0/5): minjust.gov.tm 216.250.10.199,
-#   bilim.gov.tm 216.250.8.131, science.gov.tm 216.250.11.55, belet.tm (119.235.x).
-# DROPPED:
-#   turkmenportal.com (95.85.126.182), sanly.tm (95.85.126.30),
-#   customs.gov.tm — TM IPs but INTERNATIONALLY reachable (answered 5/5 even from
-#     the blocked IP), so they would MASK a block. A TM IP is necessary but NOT
-#     sufficient — the host must be domestic-only (dark when the entry IP is blocked).
-#   ynamdar.com (93.171.223.25) — 0 echoes even from a healthy IP (firewalls ICMP).
-#
-# GUARD: each round the agent re-resolves these and DROPS any host that no longer
-# points at a Turkmenistan IP (see resolve_probe_hosts / _is_tm_ip) — e.g. one
-# that moves behind Cloudflare. That catches CDN moves; the domestic-only vetting
-# above is what catches TM-IP-but-globally-reachable sites like turkmenportal.
+# Static probe targets (not operator-configurable). Chosen empirically so each is
+# reachable from a healthy entry IP but goes silent once that IP is blocked — the
+# property that makes "all silent => blocked" reliable. Selection/vetting notes
+# are kept OUT of this repo on purpose. Each round the agent re-resolves them and
+# drops any that no longer points at the expected network (resolve_probe_hosts).
 PROBE_HOSTS = ["100haryt.com", "turkmendemiryollary.gov.tm", "tmcars.info",
                "e.gov.tm"]
 PROBE_INTERVAL = int(os.environ.get("PROBE_INTERVAL", "10"))  # seconds between probe rounds
@@ -551,8 +535,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                 "active_ip": get_active_ip(),
                 "active": active_event.is_set(),
                 "probe_interval": PROBE_INTERVAL,
-                "probe_hosts": PROBE_HOSTS,
-                "probe_ips": _probe_ips,
+                "probe_ok": len(_probe_ips),   # count only — not the target list
                 "control_port": CONTROL_PORT,
                 "panel_ips": sorted(panel_allowed_ips()),
             })
