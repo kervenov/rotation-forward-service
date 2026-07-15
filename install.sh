@@ -23,9 +23,10 @@ set -e
 PANEL_URL="https://ze.cyber-x.online:10086/api/auto-rotation/traffic"
 PANEL_IP="37.228.117.207"  # panel egress IP — control-auth works even if agent DNS is flaky
 CONTROL_PORT="8765"   # panel -> this box control endpoint (activate/deactivate)
-PROBE_INTERVAL="10"   # seconds between probe rounds (ping all 4 TM hosts)
+PROBE_INTERVAL="10"   # seconds between probe rounds (ping all TM hosts)
 PROBE_COUNT="5"       # ICMP echoes per host per round (ping -c); reachable if ANY returns
 PROBE_TIMEOUT="2"     # per-echo reply wait (ping -W, seconds)
+PROBE_DEADLINE="5"    # per-host overall deadline (ping -w) so a blocked host never hangs
 
 # When run from a clone SRC_DIR holds the sibling files; when piped through
 # `curl … | bash` there is no script dir, so the payload files are fetched
@@ -207,6 +208,7 @@ Environment=CONTROL_PORT=$CONTROL_PORT
 Environment=PROBE_INTERVAL=$PROBE_INTERVAL
 Environment=PROBE_COUNT=$PROBE_COUNT
 Environment=PROBE_TIMEOUT=$PROBE_TIMEOUT
+Environment=PROBE_DEADLINE=$PROBE_DEADLINE
 ExecStart=/usr/bin/python3 $AGENT_DST
 Restart=always
 RestartSec=5

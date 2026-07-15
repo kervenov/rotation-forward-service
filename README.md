@@ -8,16 +8,19 @@ crash-proof Python daemon (stdlib only) plus the port-forwarding rules.
   `activate` / `deactivate` this box. Accepted **only from the panel's IP**
   (no token, no operator input).
 - **Reachability probe** — while **ACTIVE**, every `PROBE_INTERVAL` seconds it
-  ICMP-pings **4 static Turkmenistan hosts** (`100haryt.com`,
-  `turkmendemiryollary.gov.tm`, `tmcars.info`, `turkmenportal.com`) **from the
-  current entry IP** (source-bound, so it tests *that* IP even on a box hosting
-  many) and POSTs the verdict to the panel: `reachable=true` if **any** host
-  answered, `reachable=false` only when **every** host is silent — i.e. the
-  entry IP is TM-blocked, so the panel rotates. Probing 4 independent hosts ×
-  `PROBE_COUNT` echoes means transient loss or one host being down can't force a
-  rotation. Kept low-profile (a short echo burst, no flooding) so a monitored
-  host doesn't treat it as a scan. While **STANDBY** it does nothing → reserved
-  boxes burn ~0 CPU/RAM.
+  ICMP-pings **4 static, domestic-only Turkmenistan hosts** (`100haryt.com`,
+  `turkmendemiryollary.gov.tm`, `tmcars.info`, `e.gov.tm`) **from the current
+  entry IP** (source-bound, so it tests *that* IP even on a box hosting many) and
+  POSTs the verdict to the panel: `reachable=true` if **any** host answered,
+  `reachable=false` only when **every** host is silent — i.e. the entry IP is
+  TM-blocked, so the panel rotates. Hosts are vetted to go DARK when the entry IP
+  is blocked (an internationally-reachable TM site like `turkmenportal.com` would
+  mask a block and is excluded); a host that later resolves to a non-TM IP
+  (Cloudflare) is dropped automatically. Probing 4 independent hosts × up to
+  `PROBE_COUNT` echoes (each capped at `PROBE_DEADLINE`s) means transient loss or
+  one host being down can't force a rotation. Kept low-profile (a short echo
+  burst, no flooding) so a monitored host doesn't treat it as a scan. While
+  **STANDBY** it does nothing → reserved boxes burn ~0 CPU/RAM.
 
 `deactivate` stops **only** the probe loop — forwarding keeps running.
 
@@ -65,6 +68,7 @@ sudo bash install.sh
 | `PROBE_INTERVAL` | `10` | Seconds between probe rounds while ACTIVE. |
 | `PROBE_COUNT` | `5` | ICMP echoes per host per round (`ping -c`); reachable if ANY returns. |
 | `PROBE_TIMEOUT` | `2` | Per-echo reply wait (`ping -W`, seconds). |
+| `PROBE_DEADLINE` | `5` | Per-host overall deadline (`ping -w`, seconds) so a blocked host never hangs. |
 | `PANEL_IP` | *(empty)* | Optional extra allowed control-source IP(s), comma-separated (e.g. if the panel egresses from a different IP than its DNS). |
 
 ## Operate

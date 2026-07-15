@@ -63,21 +63,30 @@ CONTROL_PORT = int(os.environ.get("CONTROL_PORT", "8765"))
 #   100haryt.com               216.250.12.107  working 5/5, blocked 0/5  ✓
 #   turkmendemiryollary.gov.tm 95.85.108.117   working 5/5, blocked 0/5  ✓
 #   tmcars.info                95.85.122.6     working 5/5, blocked 0/5  ✓
+#   e.gov.tm                   217.174.238.99  working 5/5, blocked 0/5  ✓  (distinct /20)
+# Vetted spares (all working 5/5, blocked 0/5): minjust.gov.tm 216.250.10.199,
+#   bilim.gov.tm 216.250.8.131, science.gov.tm 216.250.11.55, belet.tm (119.235.x).
 # DROPPED:
-#   turkmenportal.com (95.85.126.182) — a TM IP, but an INTERNATIONAL news site
-#     reachable from OUTSIDE TM: it answered 5/5 even from the blocked IP, so it
-#     would MASK a block (reachable=any stays true). Being a TM IP is necessary
-#     but NOT sufficient — the host must be domestic-only (goes dark when blocked).
+#   turkmenportal.com (95.85.126.182), sanly.tm (95.85.126.30),
+#   customs.gov.tm — TM IPs but INTERNATIONALLY reachable (answered 5/5 even from
+#     the blocked IP), so they would MASK a block. A TM IP is necessary but NOT
+#     sufficient — the host must be domestic-only (dark when the entry IP is blocked).
 #   ynamdar.com (93.171.223.25) — 0 echoes even from a healthy IP (firewalls ICMP).
 #
 # GUARD: each round the agent re-resolves these and DROPS any host that no longer
 # points at a Turkmenistan IP (see resolve_probe_hosts / _is_tm_ip) — e.g. one
 # that moves behind Cloudflare. That catches CDN moves; the domestic-only vetting
 # above is what catches TM-IP-but-globally-reachable sites like turkmenportal.
-PROBE_HOSTS = ["100haryt.com", "turkmendemiryollary.gov.tm", "tmcars.info"]
+PROBE_HOSTS = ["100haryt.com", "turkmendemiryollary.gov.tm", "tmcars.info",
+               "e.gov.tm"]
 PROBE_INTERVAL = int(os.environ.get("PROBE_INTERVAL", "10"))  # seconds between probe rounds
 PROBE_COUNT = int(os.environ.get("PROBE_COUNT", "5"))         # echoes per host per round (ping -c)
 PROBE_TIMEOUT = int(os.environ.get("PROBE_TIMEOUT", "2"))     # per-echo reply wait (ping -W, seconds)
+# Overall per-host wall-clock cap (ping -w). BOTH limits apply: send up to
+# PROBE_COUNT echoes BUT never spend more than PROBE_DEADLINE seconds on a host.
+# Critical for a BLOCKED IP: its echoes never come back, so without a deadline
+# ping could wait far too long — this caps each host at PROBE_DEADLINE seconds.
+PROBE_DEADLINE = int(os.environ.get("PROBE_DEADLINE", "5"))   # per-host deadline (ping -w, seconds)
 
 STATE_FILE = os.environ.get("STATE_FILE", "/var/lib/rotation-agent/state")
 PANEL_IP_ENV = os.environ.get("PANEL_IP", "")          # optional extra allowed IP(s), comma-sep
@@ -329,18 +338,22 @@ def ping_host(target_ip, source_ip=""):
     Kept deliberately low-profile: a short burst of a few echoes every round,
     default packet size — it reads like an ordinary reachability check, not a
     scan, so a monitored host (telecom.tm) is unlikely to treat it as hostile."""
-    cmd = ["ping", "-n", "-c", str(PROBE_COUNT), "-W", str(PROBE_TIMEOUT)]
+    # -c: up to PROBE_COUNT echoes; -W: per-echo reply wait; -w: OVERALL deadline
+    # so a black-holed (blocked) host — echoes sent, nothing ever returns — exits
+    # at PROBE_DEADLINE instead of dragging on. Both the packet count AND the
+    # time cap apply, whichever is hit first.
+    cmd = ["ping", "-n", "-c", str(PROBE_COUNT),
+           "-W", str(PROBE_TIMEOUT), "-w", str(PROBE_DEADLINE)]
     if source_ip:
         cmd += ["-I", source_ip]
     cmd.append(target_ip)
-    # Hard wall-clock cap so a black-holed host (echoes sent, nothing ever
-    # returns) can't hang the round: ping itself waits at most
-    # PROBE_COUNT * PROBE_TIMEOUT, we allow a little slack on top.
-    deadline = PROBE_COUNT * PROBE_TIMEOUT + 5
+    # Belt-and-suspenders: kill the subprocess a few seconds past ping's own -w
+    # deadline in case ping ignores it (e.g. stuck in DNS — we pass a numeric IP
+    # and -n to avoid that, but never hang the probe loop regardless).
     try:
         r = subprocess.run(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            timeout=deadline,
+            timeout=PROBE_DEADLINE + 3,
         )
         # ping exits 0 iff at least one echo was answered.
         return r.returncode == 0
@@ -385,7 +398,7 @@ def probe_reachable(source_ip=""):
         t.start()
         threads.append(t)
     for t in threads:
-        t.join(PROBE_COUNT * PROBE_TIMEOUT + 8)
+        t.join(PROBE_DEADLINE + 6)   # a little past the subprocess timeout
     reachable = any(results.values())
     return reachable, results
 
@@ -475,9 +488,10 @@ def probe_loop():
             standby_signal.clear()
             entry = get_active_ip()
             log("ACTIVE as %s — probing %d TM hosts every ~%ds "
-                "(%d echoes/host, %ds reply wait), source-bound to the entry IP"
+                "(%d echoes/host, %ds reply wait, %ds deadline), "
+                "source-bound to the entry IP"
                 % (entry or SERVER_IP, len(PROBE_HOSTS), PROBE_INTERVAL,
-                   PROBE_COUNT, PROBE_TIMEOUT))
+                   PROBE_COUNT, PROBE_TIMEOUT, PROBE_DEADLINE))
             resolve_probe_hosts()        # warm the DNS cache before the first probe
             # Probe IMMEDIATELY on activation (no initial sleep) so a freshly
             # activated IP is verified at once; then hold a ~PROBE_INTERVAL
