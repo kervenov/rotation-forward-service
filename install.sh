@@ -190,6 +190,44 @@ EOF
 echo "[*] Configuring agent service..."
 mkdir -p /var/lib/rotation-agent
 
+# --- Control port reachability (panel -> :CONTROL_PORT) ---------------------
+# The panel ACTIVATES this agent by POSTing to http://<this_ip>:CONTROL_PORT.
+# This installer never rewrites the INPUT chain (SSH safety) — but on a box with
+# an active firewall that means the panel's POST is silently DROPPED: the panel
+# logs "activate ... timed out", the agent stays STANDBY forever, no reports are
+# ever sent and Auto Rotation NEVER runs, with no obvious clue. Hit live on a ufw
+# box whose only rule was 22/tcp. So punch ONE targeted hole: panel IP ->
+# CONTROL_PORT/tcp. Nothing else is opened; existing SSH rules are untouched.
+# (VPN traffic is unaffected either way — it is FORWARDed, never INPUT.)
+echo "[*] Control port ($CONTROL_PORT) panel IP'sine açılıyor..."
+CTRL_IPS="$PANEL_IP $(getent ahostsv4 "$PANEL_HOST" 2>/dev/null | awk '{print $1}')"
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+  for pip in $(echo "$CTRL_IPS" | tr ' ' '\n' | sort -u); do
+    [ -n "$pip" ] || continue
+    if ufw allow from "$pip" to any port "$CONTROL_PORT" proto tcp >/dev/null 2>&1; then
+      echo "[OK] ufw: $pip -> :$CONTROL_PORT açıldı"
+    else
+      echo "[!] ufw kuralı eklenemedi. ELLE: ufw allow from $pip to any port $CONTROL_PORT proto tcp"
+    fi
+  done
+elif iptables -L INPUT -n 2>/dev/null | head -1 | grep -q 'policy DROP'; then
+  # No ufw, but the INPUT chain still defaults to DROP -> add + persist.
+  for pip in $(echo "$CTRL_IPS" | tr ' ' '\n' | sort -u); do
+    [ -n "$pip" ] || continue
+    if iptables -C INPUT -p tcp -s "$pip" --dport "$CONTROL_PORT" -j ACCEPT 2>/dev/null; then
+      echo "[OK] iptables: $pip -> :$CONTROL_PORT zaten açık"
+    else
+      iptables -I INPUT -p tcp -s "$pip" --dport "$CONTROL_PORT" -j ACCEPT \
+        && echo "[OK] iptables: $pip -> :$CONTROL_PORT açıldı"
+    fi
+  done
+  mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+else
+  echo "[i] Aktif firewall yok (INPUT ACCEPT) — $CONTROL_PORT zaten erişilebilir."
+fi
+echo "[i] Sağlayıcı firewall'u (cloud security group) varsa $CONTROL_PORT/tcp'yi"
+echo "    panel IP'sine oradan da açmalısın — aksi halde panel activate edemez."
+
 # Retire the previous single-script reporter if present — the agent supersedes
 # it. Leaving it running would double-report every 10s and spam the panel.
 if systemctl list-unit-files 2>/dev/null | grep -q '^traffic-reporter\.service'; then
