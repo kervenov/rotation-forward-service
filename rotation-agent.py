@@ -38,25 +38,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PANEL_URL = os.environ.get("PANEL_URL", "")            # .../api/auto-rotation/traffic
 CONTROL_PORT = int(os.environ.get("CONTROL_PORT", "8765"))
-INTERVAL = int(os.environ.get("INTERVAL", "10"))       # seconds between POSTs to the panel
-# Sampling is DECOUPLED from reporting: conntrack is read every SAMPLE seconds
-# so the byte-delta stays fine-grained (a blocked flow freezes and is detected
-# within ~SAMPLE). An IP counts as active if it transferred within the last
-# ACTIVE_WINDOW seconds; we POST that set every INTERVAL. Keeping SAMPLE small
-# is what keeps the count honest — a coarse delta would wrongly count a flow
-# that grew EARLIER in the window (before a mid-window block) as still active.
-SAMPLE = int(os.environ.get("SAMPLE_INTERVAL", "10"))  # conntrack sampling seconds
-ACTIVE_WINDOW = int(os.environ.get("ACTIVE_WINDOW", "30"))  # "active" freshness seconds
-# Minimum byte growth in a SAMPLE window for a client to count as active.
-# DEFAULT 1 = "any growth", which is the PROVEN behaviour of the old
-# forward_server_setup.sh and is CORRECT: a keepalive from an idle/asleep VPN
-# still reaching the server proves the IP is REACHABLE, so it should count (the
-# IP works). When the IP is truly BLOCKED, even keepalives can't reach -> no
-# growth -> not counted -> the count falls to 0 -> rotate. Do NOT raise this to
-# "exclude sleeping users": that would drop a reachable IP's count at night and
-# rotate a WORKING IP. Only raise it if you specifically want to ignore
-# keepalive-reachability (advanced; risks false night rotations).
-ACTIVE_MIN_BYTES = int(os.environ.get("ACTIVE_MIN_BYTES", "1"))  # bytes/window (1 = any growth)
+INTERVAL = int(os.environ.get("INTERVAL", "10"))       # seconds between reads/POSTs
+# ACTIVE detection is deliberately SIMPLE — identical to the proven
+# forward_server_setup.sh: every INTERVAL read conntrack and mark a client
+# ACTIVE iff its REQUEST bytes GREW since the last read (any growth). No
+# sampling/window/min-byte smoothing — a flow that froze this interval is
+# immediately not active, so a fully-blocked entry IP drops to 0 in one INTERVAL.
 STATE_FILE = os.environ.get("STATE_FILE", "/var/lib/rotation-agent/state")
 PANEL_IP_ENV = os.environ.get("PANEL_IP", "")          # optional extra allowed IP(s), comma-sep
 CONNTRACK = "/proc/net/nf_conntrack"
@@ -461,69 +448,56 @@ def reporter_loop():
             active_event.wait()          # STANDBY: blocks, ~0 CPU, until activated
             standby_signal.clear()
             LOCAL_IPS = gather_local_ips()   # refresh in case IPs changed
-            prev = None
-            # client_ip -> monotonic time it was last seen TRANSFERRING (byte
-            # counter grew over a SHORT SAMPLE window). This is the freshness
-            # ledger; an IP is reported active only while it stays inside
-            # ACTIVE_WINDOW, so a blocked flow (frozen bytes) ages out fast.
-            last_seen = {}
             cur_entry = get_active_ip()   # the entry IP we count/report for
-            last_post = time.monotonic()
-            log("ACTIVE as %s — sampling every %ds, window %ds, min %dB/window, "
-                "reporting every %ds" % (cur_entry or SERVER_IP, SAMPLE,
-                                         ACTIVE_WINDOW, ACTIVE_MIN_BYTES, INTERVAL))
+            prev, _ = read_conntrack(cur_entry)   # baseline (no delta on the 1st tick)
+            log("ACTIVE as %s — reporting every %ds; ACTIVE = ANY request-byte "
+                "growth since the last poll (same simple rule as the proven "
+                "forward_server_setup.sh — no window/min-byte smoothing)"
+                % (cur_entry or SERVER_IP, INTERVAL))
             while active_event.is_set():
+                # Sleep the report interval FIRST (like the original), waking at
+                # once on deactivate.
+                if standby_signal.wait(INTERVAL):
+                    break
                 try:
-                    now = time.monotonic()
                     entry = get_active_ip()
                     if entry != cur_entry:
-                        # Re-activated for a DIFFERENT entry IP (rotate landed on
-                        # this same multi-IP box) — reset the delta baseline so
-                        # we don't mix two entry IPs' flow sets.
+                        # Rotate landed on this same multi-IP box for a DIFFERENT
+                        # entry IP — reset the delta baseline so the two entry IPs'
+                        # flow sets don't mix, and skip this tick.
                         cur_entry = entry
-                        prev = None
-                        last_seen = {}
+                        prev, _ = read_conntrack(entry)
                         log("entry IP changed -> %s (baseline reset)"
                             % (entry or SERVER_IP))
-                    # Count ONLY flows that dialed the current entry IP.
+                        continue
                     cur, acct = read_conntrack(entry)
                     if not acct:
+                        # Accounting off -> can't measure. Stay SILENT (never
+                        # false-signal) and log a fixable hint.
                         log("nf_conntrack_acct OFF (no bytes=) — enable: "
                             "sysctl -w net.netfilter.nf_conntrack_acct=1")
-                    elif prev is None:
-                        # first sample: establish the byte baseline (no delta
-                        # to compare yet).
-                        log("baseline established")
-                    else:
-                        # Fine-grained delta over the LAST SAMPLE only — a flow
-                        # that froze (blocked) shows no growth here even if it
-                        # grew earlier, so it stops refreshing last_seen. A client
-                        # is "active" only if it moved MORE than ACTIVE_MIN_BYTES
-                        # this window — excludes idle/asleep clients (keepalive
-                        # only) and blocked-but-retrying handshake noise.
-                        for ip, b in cur.items():
-                            pb = prev.get(ip)
-                            growth = b if pb is None else (b - pb)
-                            if growth >= ACTIVE_MIN_BYTES:
-                                last_seen[ip] = now
-                    if acct:
                         prev = cur
-                    # Age out anyone not seen transferring within ACTIVE_WINDOW.
-                    last_seen = {ip: t for ip, t in last_seen.items()
-                                 if now - t <= ACTIVE_WINDOW}
-                    # POST the recently-active set on the report cadence.
-                    if now - last_post >= INTERVAL:
-                        active = sorted(last_seen.keys())
-                        ok = post(active, entry)
-                        log("POST(as %s) -> %d active client IP(s)%s"
-                            % (entry or SERVER_IP, len(active),
-                               "" if ok else " [FAILED]"))
-                        last_post = now
+                        continue
+                    # ACTIVE = ANY request-byte growth since the last poll — the
+                    # original's exact rule. No time-window / min-byte smoothing,
+                    # so a flow that froze THIS interval is immediately not active
+                    # and a fully-blocked entry IP drops to 0 within one INTERVAL
+                    # (fast rotate). read_conntrack already counts the REQUEST
+                    # direction only and filters to the current entry IP (multi-IP
+                    # safe) — the two fixes we keep on top of the original.
+                    active = []
+                    for ip, b in cur.items():
+                        pb = prev.get(ip)
+                        if (pb is None and b > 0) or (pb is not None and b > pb):
+                            active.append(ip)
+                    prev = cur
+                    active = sorted(set(active))
+                    ok = post(active, entry)
+                    log("POST(as %s) -> %d active client IP(s)%s"
+                        % (entry or SERVER_IP, len(active),
+                           "" if ok else " [FAILED]"))
                 except Exception as e:
                     log("reporter tick error (continuing):", e)
-                # Sleep the SHORT sampling interval, wake at once if deactivated.
-                if standby_signal.wait(SAMPLE):
-                    break
             log("STANDBY — traffic reports stopped (forwarding untouched)")
         except Exception as e:
             log("reporter loop error (restarting loop):", e)
@@ -618,9 +592,8 @@ def main():
         sys.exit(1)
     LOCAL_IPS = gather_local_ips()
     log("agent start: server_ip=%s local_ips=%s panel=%s control_port=%d "
-        "interval=%ds sample=%ds window=%ds"
-        % (SERVER_IP, sorted(LOCAL_IPS), PANEL_URL, CONTROL_PORT,
-           INTERVAL, SAMPLE, ACTIVE_WINDOW))
+        "interval=%ds (active = any request-byte growth/interval)"
+        % (SERVER_IP, sorted(LOCAL_IPS), PANEL_URL, CONTROL_PORT, INTERVAL))
 
     # Resume the last role (and which IP we were serving) across restarts.
     resumed_active, resumed_ip = load_state()
