@@ -44,8 +44,15 @@ provide() {   # provide <filename> <dest> <mode>
     install -m "$mode" "$SRC_DIR/$name" "$dst"
   else
     echo "[*] $name indiriliyor (repo raw)..."
-    curl -fsSL "$RAW_BASE/$name" -o "$dst" \
-      || { echo "[ERR] $name indirilemedi (ağ/DNS?). Sonra tekrar deneyin."; exit 1; }
+    # Bounded + retried: WITHOUT these curl can hang FOREVER on a stalled
+    # connection (observed live — the installer froze at this line). Cap the
+    # connect and the whole transfer, and retry transient failures/timeouts.
+    curl -fsSL --connect-timeout 15 --max-time 60 \
+         --retry 4 --retry-delay 3 --retry-connrefused \
+         "$RAW_BASE/$name" -o "$dst" \
+      || { echo "[ERR] $name indirilemedi (ağ/DNS/GitHub erişimi?)."
+           echo "      Tekrar deneyin; sürerse: curl -v $RAW_BASE/$name"
+           exit 1; }
     chmod "$mode" "$dst"
   fi
 }
