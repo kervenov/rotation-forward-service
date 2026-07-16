@@ -93,28 +93,6 @@ for pip in $(echo "$PANEL_IPS_NAT" | tr ' ' '\n' | sort -u); do
     || iptables -t nat -I POSTROUTING 1 -p tcp -d "$pip" --dport "$PANEL_PORT_NAT" -j RETURN
 done
 
-# --- Preserve source IP for the agent's OWN probe pings (multi-IP boxes) -----
-# The agent source-binds its ICMP probes to the CURRENT entry IP (ping -I) so it
-# tests reachability AS that specific IP. The catch-all MASQUERADE above would
-# otherwise rewrite that bound source to the interface's PRIMARY IP — which would
-# make a BLOCKED entry IP's probe egress via a WORKING IP and always answer,
-# hiding the block forever (the exact multi-IP trap the operator hit: a plain
-# `ping -I 104.171.133.75` still succeeded because it left as the primary IP).
-# Excluding every LOCAL public IP from NAT makes the bound source survive.
-#
-# SAFETY: this matches ONLY packets whose source is ALREADY one of THIS box's
-# IPs — i.e. traffic the box itself originated (the agent's pings + report POST).
-# Forwarded VPN traffic has a REMOTE source (client/node) at this point and is
-# SNAT'd by the MASQUERADE below, so DNAT/FORWARD is completely untouched. RFC1918
-# / loopback / link-local are excluded so a private mgmt IP still gets SNAT.
-for lip in $(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 \
-             | grep -vE '^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)' \
-             | sort -u); do
-  [ -n "$lip" ] || continue
-  iptables -t nat -C POSTROUTING -s "$lip" -j RETURN 2>/dev/null \
-    || iptables -t nat -I POSTROUTING 1 -s "$lip" -j RETURN
-done
-
 mkdir -p /etc/iptables
 iptables-save > /etc/iptables/rules.v4
 
