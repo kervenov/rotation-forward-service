@@ -63,7 +63,7 @@ CONTROL_PORT = int(os.environ.get("CONTROL_PORT", "8765"))
 # drops any that no longer points at the expected network (resolve_probe_hosts).
 PROBE_HOSTS = ["100haryt.com", "turkmendemiryollary.gov.tm", "tmcars.info",
                "e.gov.tm"]
-PROBE_INTERVAL = int(os.environ.get("PROBE_INTERVAL", "10"))  # seconds between probe rounds
+PROBE_INTERVAL = int(os.environ.get("PROBE_INTERVAL", "40"))  # seconds between probe rounds (gentle)
 PROBE_COUNT = int(os.environ.get("PROBE_COUNT", "5"))         # echoes per host per round (ping -c)
 PROBE_TIMEOUT = int(os.environ.get("PROBE_TIMEOUT", "2"))     # per-echo reply wait (ping -W, seconds)
 # Overall per-host wall-clock cap (ping -w). BOTH limits apply: send up to
@@ -82,6 +82,15 @@ SERVER_IP = ""
 # connect to the cached IPs so a transient DNS blip can't look like a block.
 _probe_ips_lock = threading.Lock()
 _probe_ips = {}          # host -> ip (last good)
+
+# Anti-hammer: a given entry IP is probed at most once per PROBE_INTERVAL, even
+# across rapid deactivate/reactivate churn. Without this, a panel self-rotate (or
+# any tight activate/deactivate loop) makes the agent re-probe every few seconds,
+# and that burst is exactly what gets the source IP rate-limited by the TM hosts
+# — which then reads as a false block. A DIFFERENT (newly-rotated) entry IP is
+# still probed IMMEDIATELY, so a genuine rotate reacts fast. Module-level so it
+# persists across active/standby cycles.
+_last_probe = {"ip": "", "mono": -1e9}
 
 # The IP the panel last ACTIVATED this box for — learned from the LOCAL address
 # of the activate control connection. One physical box may host many public IPs
@@ -477,13 +486,25 @@ def probe_loop():
                 % (entry or SERVER_IP, len(PROBE_HOSTS), PROBE_INTERVAL,
                    PROBE_COUNT, PROBE_TIMEOUT, PROBE_DEADLINE))
             resolve_probe_hosts()        # warm the DNS cache before the first probe
-            # Probe IMMEDIATELY on activation (no initial sleep) so a freshly
-            # activated IP is verified at once; then hold a ~PROBE_INTERVAL
-            # start-to-start cadence (the probe itself takes a few seconds).
+            # Probe a NEWLY-activated IP IMMEDIATELY (fast rotate reaction); but a
+            # SAME IP re-activated within PROBE_INTERVAL waits out the remainder
+            # first (anti-hammer) so churn can't turn this into a tight ICMP loop.
             while active_event.is_set():
+                entry = get_active_ip()
+                gap = time.monotonic() - _last_probe["mono"]
+                if entry == _last_probe["ip"] and gap < PROBE_INTERVAL:
+                    # Same IP, probed recently — don't re-ping yet (avoids the
+                    # rate-limit-inducing burst under rapid activate/deactivate).
+                    if standby_signal.wait(PROBE_INTERVAL - gap):
+                        break
+                    continue
                 t0 = time.monotonic()
+                # Mark the probe START now (not after) so the cadence is exactly
+                # PROBE_INTERVAL start-to-start and a mid-probe exception can't
+                # cause a re-probe next iteration.
+                _last_probe["ip"] = entry
+                _last_probe["mono"] = t0
                 try:
-                    entry = get_active_ip()
                     reachable, detail = probe_reachable(entry)
                     ok = post(reachable, entry, detail)
                     summary = ", ".join(

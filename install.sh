@@ -23,7 +23,7 @@ set -e
 PANEL_URL="https://ze.cyber-x.online:10086/api/auto-rotation/traffic"
 PANEL_IP="37.228.117.207"  # panel egress IP — control-auth works even if agent DNS is flaky
 CONTROL_PORT="8765"   # panel -> this box control endpoint (activate/deactivate)
-PROBE_INTERVAL="10"   # seconds between probe rounds (ping all TM hosts)
+PROBE_INTERVAL="40"   # seconds between probe rounds (gentle — a tight cadence gets the source IP rate-limited by the TM hosts, which reads as a false block)
 PROBE_COUNT="5"       # ICMP echoes per host per round (ping -c); reachable if ANY returns
 PROBE_TIMEOUT="2"     # per-echo reply wait (ping -W, seconds)
 PROBE_DEADLINE="5"    # per-host overall deadline (ping -w) so a blocked host never hangs
