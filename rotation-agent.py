@@ -549,7 +549,19 @@ class ControlHandler(BaseHTTPRequestHandler):
         # internet scanner hitting :8765 must not map the infrastructure.
         if self.path.rstrip("/") in ("/health", "/status", ""):
             peer = self.client_address[0]
-            if peer not in ("127.0.0.1", "::1") and peer not in panel_allowed_ips():
+            # The portfwd catch-all MASQUERADE rewrites a `curl 127.0.0.1` SOURCE
+            # to a box IP, so `peer` can read as a public box IP for a genuine
+            # LOCAL request (why the documented health curl returned "forbidden").
+            # The connection's LOCAL address (what the client DIALED) is not
+            # rewritten: a client that dialed 127.0.0.1 lands here with a loopback
+            # local address regardless of the source SNAT — trust that too.
+            try:
+                local_addr = self.connection.getsockname()[0]
+            except Exception:
+                local_addr = ""
+            if (local_addr not in ("127.0.0.1", "::1")
+                    and peer not in ("127.0.0.1", "::1")
+                    and peer not in panel_allowed_ips()):
                 return self._send(403, {"detail": "forbidden", "peer": peer})
             return self._send(200, {
                 "server_ip": SERVER_IP,
