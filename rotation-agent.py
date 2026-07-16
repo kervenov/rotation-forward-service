@@ -12,10 +12,14 @@ Two jobs in one process:
    "deactivate" only stops the reporting loop; the box keeps forwarding.
 
 2. TRAFFIC REPORTER (gated by the active flag): while ACTIVE, every INTERVAL
-   seconds it reads conntrack, finds the client IPs that actually moved bytes
-   since the last poll, and POSTs them to the panel. While STANDBY it does
-   nothing — a reserved server sits idle until the panel activates it. This is
-   why reserved boxes burn no CPU/RAM.
+   seconds it reads conntrack and POSTs the client IPs that completed a ROUND
+   TRIP in that interval — request bytes (client -> this IP) AND reply bytes
+   (internet -> this IP) BOTH grew since the last poll. Requiring both, and
+   requiring GROWTH (conntrack counters are cumulative and entries linger long
+   after a flow dies), is what separates "working right now" from "worked once"
+   and from one-way dead clients. While STANDBY it does nothing — a reserved
+   server sits idle until the panel activates it. This is why reserved boxes
+   burn no CPU/RAM.
 
 The role (active/standby) is persisted to STATE_FILE, so a restart resumes the
 last role and a lost/queued activate isn't forgotten across a crash. Every
@@ -39,11 +43,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 PANEL_URL = os.environ.get("PANEL_URL", "")            # .../api/auto-rotation/traffic
 CONTROL_PORT = int(os.environ.get("CONTROL_PORT", "8765"))
 INTERVAL = int(os.environ.get("INTERVAL", "10"))       # seconds between reads/POSTs
-# ACTIVE detection is deliberately SIMPLE — identical to the proven
-# forward_server_setup.sh: every INTERVAL read conntrack and mark a client
-# ACTIVE iff its REQUEST bytes GREW since the last read (any growth). No
-# sampling/window/min-byte smoothing — a flow that froze this interval is
-# immediately not active, so a fully-blocked entry IP drops to 0 in one INTERVAL.
+# ACTIVE detection (operator's rule): every INTERVAL read conntrack and mark a
+# client ACTIVE iff BOTH directions grew since the last read — the request
+# reached this IP AND the response came back through it:
+#     TM client -> request -> internet -> response -> TM client
+# Requiring the COMPLETE round trip drops one-way (dead) clients: a broken client
+# can still emit retry/handshake bytes (request grows, no answer), and a
+# TM-blocked client can't send while the node keeps blasting replies (Brutal CC).
+# Neither counts. No sampling/window/min-byte smoothing — a flow that froze this
+# interval is immediately not active, so a blocked entry IP drops to 0 in one
+# INTERVAL.
 STATE_FILE = os.environ.get("STATE_FILE", "/var/lib/rotation-agent/state")
 PANEL_IP_ENV = os.environ.get("PANEL_IP", "")          # optional extra allowed IP(s), comma-sep
 CONNTRACK = "/proc/net/nf_conntrack"
@@ -308,8 +317,14 @@ def _conntrack_lines():
 
 
 def read_conntrack(entry_ip=""):
-    """Return (totals{client_ip: bytes}, acct_seen), counting ONLY forwarded
-    (DNAT'd) flows that dialed the CURRENT entry IP.
+    """Return (totals{client_ip: [req_bytes, rep_bytes]}, acct_seen), counting
+    ONLY forwarded (DNAT'd) flows that dialed the CURRENT entry IP.
+
+    BOTH directions are returned so the caller can require a COMPLETE round trip
+    (see reporter_loop). Each conntrack line carries two byte counters:
+      byte_fields[0] = ORIGINAL tuple = CLIENT -> this box   (the REQUEST)
+      byte_fields[1] = REPLY    tuple = NODE   -> this box   (the RESPONSE)
+    i.e. the operator's flow: TM client -> request -> internet -> response.
 
     The client is the FIRST src (original tuple source) and the entry IP is the
     FIRST dst (original tuple destination — the box IP the client actually
@@ -335,18 +350,14 @@ def read_conntrack(entry_ip=""):
                     byte_fields.append(int(p[6:]))
                 except ValueError:
                     pass
-        if len(srcs) < 2:
+        # Need BOTH counters to judge a round trip. (With nf_conntrack_acct on,
+        # every flow carries both; a line with fewer is unusable, not "idle".)
+        if len(srcs) < 2 or len(byte_fields) < 2:
             continue
         orig_src, reply_src = srcs[0], srcs[1]
         orig_dst = dsts[0] if dsts else ""
-        # ORIGINAL (client -> server) bytes ONLY = the client actually SENDING
-        # to this IP. This is the sole proof the client can REACH the IP. Do NOT
-        # add the reply direction (node -> server): when TM blocks the entry IP
-        # the client can't send (this freezes) BUT the node keeps blasting the
-        # reply — the fork's Brutal congestion control sends at a FIXED RATE
-        # regardless of ACKs, so a blocked client's reply bytes keep growing.
-        # Summing both would count a blocked client as active forever.
-        orig_bytes = byte_fields[0] if byte_fields else 0
+        req = byte_fields[0]   # CLIENT -> box : the client can REACH this IP
+        rep = byte_fields[1]   # NODE   -> box : the internet ANSWERED
         # Only clients that dialed the CURRENT entry IP (original dst). A box
         # hosting many entry IPs forwards the VPN on ALL of them (per-port DNAT),
         # so a blocked entry IP must not look alive because OTHER entry IPs still
@@ -363,7 +374,9 @@ def read_conntrack(entry_ip=""):
             continue
         if not is_public(orig_src):
             continue
-        totals[orig_src] = totals.get(orig_src, 0) + orig_bytes
+        t = totals.setdefault(orig_src, [0, 0])
+        t[0] += req
+        t[1] += rep
     return totals, acct_seen
 
 
@@ -450,9 +463,9 @@ def reporter_loop():
             LOCAL_IPS = gather_local_ips()   # refresh in case IPs changed
             cur_entry = get_active_ip()   # the entry IP we count/report for
             prev, _ = read_conntrack(cur_entry)   # baseline (no delta on the 1st tick)
-            log("ACTIVE as %s — reporting every %ds; ACTIVE = ANY request-byte "
-                "growth since the last poll (same simple rule as the proven "
-                "forward_server_setup.sh — no window/min-byte smoothing)"
+            log("ACTIVE as %s — reporting every %ds; ACTIVE = COMPLETE round trip "
+                "this interval (request grew AND response grew) — dead one-way "
+                "clients are not counted"
                 % (cur_entry or SERVER_IP, INTERVAL))
             while active_event.is_set():
                 # Sleep the report interval FIRST (like the original), waking at
@@ -478,17 +491,32 @@ def reporter_loop():
                             "sysctl -w net.netfilter.nf_conntrack_acct=1")
                         prev = cur
                         continue
-                    # ACTIVE = ANY request-byte growth since the last poll — the
-                    # original's exact rule. No time-window / min-byte smoothing,
-                    # so a flow that froze THIS interval is immediately not active
-                    # and a fully-blocked entry IP drops to 0 within one INTERVAL
-                    # (fast rotate). read_conntrack already counts the REQUEST
-                    # direction only and filters to the current entry IP (multi-IP
-                    # safe) — the two fixes we keep on top of the original.
+                    # ACTIVE = a COMPLETE round trip in this interval: the client
+                    # REACHED this IP (request grew) *AND* the internet ANSWERED
+                    # back through it (reply grew). Operator's rule:
+                    #   TM client -> request -> internet -> response -> TM client
+                    # Requiring BOTH kills the two false-actives a single
+                    # direction lets through:
+                    #   * request-only: a DEAD/broken client that can still push
+                    #     retry/handshake bytes but never gets an answer would
+                    #     count as active (reply frozen -> now excluded).
+                    #   * reply-only: a TM-BLOCKED client can't send at all, yet
+                    #     the node keeps blasting the reply (Brutal CC sends at a
+                    #     fixed rate regardless of ACKs) -> would count forever
+                    #     (request frozen -> excluded).
+                    # No time-window / min-byte smoothing, so a flow that froze
+                    # THIS interval is immediately not active and a blocked entry
+                    # IP drops to 0 within one INTERVAL (fast rotate).
                     active = []
-                    for ip, b in cur.items():
-                        pb = prev.get(ip)
-                        if (pb is None and b > 0) or (pb is not None and b > pb):
+                    for ip, (req, rep) in cur.items():
+                        p = prev.get(ip)
+                        if p is None:
+                            # First time we see this client: count it only if both
+                            # directions have actually carried bytes (a client
+                            # mid-handshake shows req>0 while rep is still 0).
+                            if req > 0 and rep > 0:
+                                active.append(ip)
+                        elif req > p[0] and rep > p[1]:
                             active.append(ip)
                     prev = cur
                     active = sorted(set(active))
@@ -592,7 +620,7 @@ def main():
         sys.exit(1)
     LOCAL_IPS = gather_local_ips()
     log("agent start: server_ip=%s local_ips=%s panel=%s control_port=%d "
-        "interval=%ds (active = any request-byte growth/interval)"
+        "interval=%ds (active = request AND response both grew this interval)"
         % (SERVER_IP, sorted(LOCAL_IPS), PANEL_URL, CONTROL_PORT, INTERVAL))
 
     # Resume the last role (and which IP we were serving) across restarts.

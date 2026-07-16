@@ -22,7 +22,7 @@ set -e
 PANEL_URL="https://ze.cyber-x.online:10086/api/auto-rotation/traffic"
 PANEL_IP="37.228.117.207"  # panel egress IP — control-auth works even if agent DNS is flaky
 CONTROL_PORT="8765"   # panel -> this box control endpoint (activate/deactivate)
-INTERVAL="10"         # seconds between reads/POSTs. ACTIVE = any request-byte growth per interval (same simple rule as the proven forward_server_setup.sh; no window/min-byte)
+INTERVAL="10"         # seconds between reads/POSTs. ACTIVE = COMPLETE round trip per interval: request (client->IP) AND response (internet->IP) BOTH grew. One-way (dead/retry-only) clients are not counted.
 
 # When run from a clone SRC_DIR holds the sibling files; when piped through
 # `curl … | bash` there is no script dir, so the payload files are fetched
