@@ -164,22 +164,55 @@ def deactivate_for(local_ip):
     return True
 
 
+def _ips_via_hostname():
+    out = subprocess.run(
+        ["hostname", "-I"], stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, timeout=5,
+    )
+    return out.stdout.decode("utf-8", "replace").split()
+
+
+def _ips_via_ip_cmd():
+    """`ip -o addr show` fallback: minimal VPS images often ship no `hostname`
+    binary, but iproute2 is virtually always there."""
+    out = subprocess.run(
+        ["ip", "-o", "addr", "show"], stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, timeout=5,
+    )
+    found = []
+    for line in out.stdout.decode("utf-8", "replace").splitlines():
+        parts = line.split()
+        for i, p in enumerate(parts):
+            if p in ("inet", "inet6") and i + 1 < len(parts):
+                found.append(parts[i + 1].split("/")[0])
+    return found
+
+
 def gather_local_ips():
-    """Every IPv4/IPv6 address configured on this box (`hostname -I`) plus the
-    detected egress IP. Cheap; called at startup and each time the reporter
-    goes ACTIVE so a freshly-added IP is recognised as local."""
+    """Every IP configured on this box, plus the detected egress IP. Cheap;
+    called at startup and each time the reporter goes ACTIVE so a freshly-added
+    IP is recognised as local.
+
+    Tries `hostname -I` then `ip -o addr` — a minimal image may have neither the
+    hostname binary nor iproute2, and getting this WRONG matters: LOCAL_IPS is
+    what excludes the box's OWN flows (SSH, DNS, the agent's POST) from the
+    client count, so on a multi-IP box an empty set would miscount the box's own
+    secondary-IP traffic as VPN clients."""
     ips = set()
-    try:
-        out = subprocess.run(
-            ["hostname", "-I"], stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, timeout=5,
-        )
-        for tok in out.stdout.decode("utf-8", "replace").split():
-            tok = tok.strip()
-            if tok:
-                ips.add(tok)
-    except Exception as e:
-        log("hostname -I failed (%s) — excluding detected egress only" % e)
+    for fn, name in ((_ips_via_hostname, "hostname -I"),
+                     (_ips_via_ip_cmd, "ip -o addr")):
+        try:
+            for tok in fn():
+                tok = tok.strip()
+                if tok:
+                    ips.add(tok)
+            if ips:
+                break          # first source that produced anything is enough
+        except Exception as e:
+            log("%s unavailable (%s) — trying next source" % (name, e))
+    if not ips:
+        log("could not enumerate local IPs (no hostname/ip binary?) — only the "
+            "detected egress IP is excluded from the client count")
     if SERVER_IP:
         ips.add(SERVER_IP)
     return ips

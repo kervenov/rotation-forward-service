@@ -58,13 +58,45 @@ provide() {   # provide <filename> <dest> <mode>
 }
 
 # ---------------------------------------------------------------------------
-# 1) Dependencies — robust to a locked dpkg (unattended-upgrades at boot) and
-#    to DNS/mirror failures. NEVER aborts the install: python3 is virtually
-#    always preinstalled, and conntrack-tools is only a fallback used when
-#    /proc/net/nf_conntrack is absent.
+# 1) Dependencies — FULLY FLEXIBLE, meant to survive ANY VPS image.
+#    * Detects the package manager (apt/dnf/yum/apk/pacman/zypper) and maps
+#      per-distro package names — a minimal image often ships NO iptables.
+#    * Installs only what is MISSING.
+#    * Survives a locked dpkg (unattended-upgrades at boot), DNS/mirror
+#      failures and a stalled mirror.
+#    * ABORTS only when a structurally essential piece is missing and cannot be
+#      installed (systemd / python3 / iptables). Everything else degrades with a
+#      loud, actionable warning instead of a half-broken install.
 # ---------------------------------------------------------------------------
 export DEBIAN_FRONTEND=noninteractive
 PANEL_HOST="$(echo "$PANEL_URL" | sed -E 's#^[a-z]+://##; s#[:/].*$##')"
+
+# systemd is structural (both units are systemd services). Fail EARLY and
+# clearly instead of installing half of everything and dying at `systemctl`.
+if ! command -v systemctl >/dev/null 2>&1; then
+  echo "[ERR] systemd yok (systemctl bulunamadı) — bu installer systemd gerektirir."
+  echo "      OpenRC/Alpine gibi init'lerde servisleri elle tanımlamanız gerekir."
+  exit 1
+fi
+
+# 'sudo: unable to resolve host <name>' — the box's own hostname is missing from
+# /etc/hosts. Cosmetic, but it prints on EVERY sudo call. Fix it once.
+_HN="$(hostname 2>/dev/null || true)"
+if [ -n "$_HN" ] && ! grep -qE "(^|[[:space:]])${_HN}([[:space:]]|$)" /etc/hosts 2>/dev/null; then
+  echo "127.0.1.1 $_HN" >> /etc/hosts 2>/dev/null \
+    && echo "[OK] /etc/hosts: '$_HN' eklendi (sudo host uyarısı susar)"
+fi
+
+# --- package-manager abstraction -------------------------------------------
+PKG=""
+for _p in apt-get dnf yum apk pacman zypper; do
+  command -v "$_p" >/dev/null 2>&1 && { PKG="$_p"; break; }
+done
+if [ -n "$PKG" ]; then
+  echo "[i] Paket yöneticisi: $PKG"
+else
+  echo "[!] Paket yöneticisi bulunamadı — eksik araçlar elle kurulmalı."
+fi
 
 apt_locked() {
   # fuser is authoritative — it names the PID actually HOLDING the lock file.
@@ -98,12 +130,55 @@ wait_for_apt() {
   done
   echo "[OK] kilit açıldı."
 }
-apt_install() {   # best-effort; returns non-zero on failure so caller can fall back
-  wait_for_apt
-  # -o DPkg::Lock::Timeout: apt WAITS for the lock instead of erroring out.
-  apt-get -o DPkg::Lock::Timeout=180 update -qq 2>/dev/null \
-    || echo "[!] apt update başarısız (DNS/mirror) — cache ile deneniyor"
-  apt-get -o DPkg::Lock::Timeout=180 install -y -qq "$@" 2>/dev/null
+pkg_install() {   # best-effort; never aborts. usage: pkg_install <pkg>...
+  case "$PKG" in
+    apt-get)
+      wait_for_apt
+      # -o DPkg::Lock::Timeout: apt WAITS for the lock instead of erroring out.
+      apt-get -o DPkg::Lock::Timeout=180 update -qq 2>/dev/null \
+        || echo "[!] apt update başarısız (DNS/mirror) — cache ile deneniyor"
+      apt-get -o DPkg::Lock::Timeout=180 install -y -qq "$@" 2>/dev/null
+      ;;
+    dnf)    dnf install -y -q "$@" 2>/dev/null ;;
+    yum)    yum install -y -q "$@" 2>/dev/null ;;
+    apk)    apk add --no-cache "$@" 2>/dev/null ;;
+    pacman) pacman -Sy --noconfirm --needed "$@" 2>/dev/null ;;
+    zypper) zypper --non-interactive install "$@" 2>/dev/null ;;
+    *)      return 1 ;;
+  esac
+}
+
+pkg_name() {   # per-distro package name for a generic tool
+  case "$1" in
+    conntrack)
+      case "$PKG" in apt-get) echo conntrack ;; *) echo conntrack-tools ;; esac ;;
+    python3)
+      case "$PKG" in pacman) echo python ;; *) echo python3 ;; esac ;;
+    hostname)
+      case "$PKG" in pacman) echo inetutils ;; apk) echo busybox ;; *) echo hostname ;; esac ;;
+    iproute2)
+      case "$PKG" in dnf|yum|zypper) echo iproute ;; *) echo iproute2 ;; esac ;;
+    *) echo "$1" ;;
+  esac
+}
+
+ensure_tool() {   # ensure_tool <command> <generic-pkg> [required]
+  local cmd="$1" generic="$2" req="${3:-}" pkg
+  command -v "$cmd" >/dev/null 2>&1 && return 0
+  pkg="$(pkg_name "$generic")"
+  echo "[*] '$cmd' yok — kuruluyor ($pkg)..."
+  pkg_install "$pkg" || true
+  if command -v "$cmd" >/dev/null 2>&1; then
+    echo "[OK] '$cmd' kuruldu."
+    return 0
+  fi
+  if [ "$req" = "required" ]; then
+    echo "[ERR] '$cmd' kurulamadı ve ZORUNLU — kurulum durduruldu."
+    echo "      Ağ/depo düzelince elle kurup tekrar çalıştırın:  $PKG install $pkg"
+    exit 1
+  fi
+  echo "[!] '$cmd' kurulamadı (opsiyonel) — devam ediliyor."
+  return 1
 }
 ensure_dns() {    # so BOTH apt and the agent can resolve the panel host
   getent hosts "$1" >/dev/null 2>&1 && return 0
@@ -122,38 +197,54 @@ ensure_dns() {    # so BOTH apt and the agent can resolve the panel host
 ensure_dns "$PANEL_HOST" \
   || echo "[!] DNS hâlâ sorunlu — agent panel host'u çözemezse install.sh içinde PANEL_IP ayarlayın"
 
-# curl — needed by provide() to fetch the payload files when piped. Almost
-# always present (the one-liner is fetched with it), but make sure.
-command -v curl >/dev/null 2>&1 || { echo "[*] curl kuruluyor..."; apt_install curl || true; }
-
-# python3 — fatal only if truly absent AND uninstallable.
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "[*] python3 yok — kuruluyor..."
-  apt_install python3 || true
+# --- ESSENTIAL: abort only if these truly cannot be installed ---------------
+# curl is only needed when the payloads must be DOWNLOADED (the piped one-liner).
+# A local clone already has them, so don't hard-require curl in that case.
+if [ ! -f "$SRC_DIR/rotation-agent.py" ] || [ ! -f "$SRC_DIR/rotation-portfwd.sh" ]; then
+  ensure_tool curl curl required
 fi
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "[ERR] python3 yok ve kurulamadı. Ağ/DNS düzelince: apt-get install -y python3"
-  exit 1
-fi
+ensure_tool python3 python3 required     # the agent itself (stdlib only)
+# iptables: the WHOLE point of this box (DNAT/MASQUERADE). Minimal images ship
+# without it, and portfwd would fail line-by-line with no clear cause.
+ensure_tool iptables iptables required
 
-# conntrack-tools — ONLY a fallback for kernels without /proc/net/nf_conntrack.
+# --- OPTIONAL: the agent degrades gracefully without these ------------------
+ensure_tool ip       iproute2 || true    # default route / local IP discovery
+ensure_tool hostname hostname || true    # agent's `hostname -I` (has an ip fallback)
+
+# conntrack-tools — needed ONLY when the kernel has no /proc/net/nf_conntrack
+# (CONFIG_NF_CONNTRACK_PROCFS off — common on modern kernels).
 modprobe nf_conntrack 2>/dev/null || true
-if [ ! -r /proc/net/nf_conntrack ] && ! command -v conntrack >/dev/null 2>&1; then
-  echo "[*] conntrack yok ve /proc/net/nf_conntrack yok — kurmayı deniyorum..."
-  apt_install conntrack || true
+if [ ! -r /proc/net/nf_conntrack ]; then
+  ensure_tool conntrack conntrack || true
 fi
 if [ ! -r /proc/net/nf_conntrack ] && ! command -v conntrack >/dev/null 2>&1; then
   echo "[!] UYARI: conntrack okunamıyor (ne /proc dosyası ne de binary)."
-  echo "    Ağ/DNS düzelince:  apt-get install -y conntrack"
-  echo "    Agent yine de kurulacak; conntrack gelene kadar rapor gönderemez ama"
+  echo "    Agent yine de kurulacak; conntrack gelene kadar rapor GÖNDEREMEZ ama"
   echo "    ASLA yanlış sinyal vermez ve ASLA çökmez (sessiz bekler)."
 fi
 
-# conntrack byte accounting — REQUIRED for the bytes= deltas the agent uses.
-echo "[*] Enabling nf_conntrack_acct (persistent)..."
-echo "net.netfilter.nf_conntrack_acct = 1" > /etc/sysctl.d/99-conntrack-acct.conf
-sysctl -w net.netfilter.nf_conntrack_acct=1 >/dev/null 2>&1 || true
+# --- conntrack byte accounting — the agent CANNOT measure without it --------
+# Without bytes= the agent stays silent forever (fail-safe) and Auto Rotation
+# never runs — so enable it, PERSIST it, and VERIFY it actually took (a silent
+# failure here cost a long debugging session).
+echo "[*] nf_conntrack_acct açılıyor (kalıcı)..."
+mkdir -p /etc/sysctl.d 2>/dev/null || true
+echo "net.netfilter.nf_conntrack_acct = 1" > /etc/sysctl.d/99-conntrack-acct.conf 2>/dev/null || true
+# sysctl may be absent on a minimal image -> write the /proc knob directly.
+sysctl -w net.netfilter.nf_conntrack_acct=1 >/dev/null 2>&1 \
+  || echo 1 > /proc/sys/net/netfilter/nf_conntrack_acct 2>/dev/null || true
 modprobe nf_conntrack_netlink 2>/dev/null || true
+if [ "$(cat /proc/sys/net/netfilter/nf_conntrack_acct 2>/dev/null)" = "1" ]; then
+  echo "[OK] nf_conntrack_acct = 1"
+  echo "[i]  Not: acct yalnızca YENİ conntrack kayıtlarına sayaç ekler — mevcut"
+  echo "     akışlar yenilenene kadar sayılmaz, o yüzden aktif sayısı yavaş"
+  echo "     tırmanır. Hemen oturması için (anlık kopma):  conntrack -F"
+else
+  echo "[!] nf_conntrack_acct AÇILAMADI — agent byte sayamaz, rapor GÖNDEREMEZ"
+  echo "    (panelde 'NO FRESH REPORT' kalır). Elle deneyin:"
+  echo "      sysctl -w net.netfilter.nf_conntrack_acct=1"
+fi
 
 # ---------------------------------------------------------------------------
 # 2) Fetch BOTH payloads FIRST (while DNS is pristine), THEN apply forwarding.
